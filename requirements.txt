@@ -1,0 +1,9 @@
+requests
+bs4
+argparse
+tqdm
+tenacity
+pyrogram
+tgcrypto
+python-dotenv
+flask
