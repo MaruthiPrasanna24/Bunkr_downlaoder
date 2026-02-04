@@ -29,7 +29,12 @@ def get_items_list(session, url, extensions, only_export, custom_path=None, is_l
     extensions_list = extensions.split(',') if extensions is not None else []
     
     logger.info(f"[GET ITEMS LIST] Fetching: {url}")
-    r = session.get(url)
+    try:
+        r = session.get(url, timeout=30)
+    except Exception as e:
+        logger.error(f"[GET ITEMS LIST] Request error: {e}")
+        raise
+    
     if r.status_code != 200:
         logger.error(f"[GET ITEMS LIST] HTTP error {r.status_code}")
         raise Exception(f"[-] HTTP error {r.status_code}")
@@ -133,7 +138,7 @@ def get_real_download_url(session, url, is_bunkr=True, item_name=None):
             url = url.replace('/f/', '/api/f/')
 
         logger.info(f"[GET REAL URL] Fetching: {url}")
-        r = session.get(url)
+        r = session.get(url, timeout=30)
         if r.status_code != 200:
             logger.error(f"[GET REAL URL] HTTP error {r.status_code} for {url}")
             print(f"\t[-] HTTP error {r.status_code} getting real url for {url}")
@@ -199,13 +204,16 @@ def download(session, item_url, download_path, is_bunkr=False, file_name=None):
 
 
 def create_session():
-    """Create HTTP session with proper headers"""
+    """Create HTTP session with proper headers and timeout"""
+    logger.info("[SESSION] Creating new session...")
     session = requests.Session()
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
         'Referer': 'https://bunkr.sk/',
     })
-    logger.info("[SESSION] Created new session")
+    # Set default timeout for all requests
+    session.timeout = 30
+    logger.info("[SESSION] Session created with timeout=30s")
     return session
 
 
