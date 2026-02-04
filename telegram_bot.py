@@ -18,6 +18,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
 try:
     from moviepy.editor import VideoFileClip
@@ -63,18 +64,18 @@ async def safe_edit(msg: Message, text: str):
 
 def human_bytes(size: int) -> str:
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size < 1024:
-            return f"{size:.2f} {unit}" if unit != 'B' else f"{size} {unit}"
-        size /= 1024
+        if size < 1024.0:
+            return f"{size:.2f} {unit}" if unit != 'B' else f"{int(size)} {unit}"
+        size /= 1024.0
     return f"{size:.2f} PB"
 
 async def download_progress(current: int, total: int, status_msg: Message, file_name: str, idx: int, total_items: int, last_update: list, start_time: float):
     current_time = time.time()
-    if current_time - last_update[0] < 4.0:
+    if current_time - last_update[0] < 4:
         return
     last_update[0] = current_time
 
-    if total == 0:
+    if total <= 0:
         return
 
     percent = int(current * 100 / total)
@@ -94,11 +95,11 @@ async def download_progress(current: int, total: int, status_msg: Message, file_
 
 async def upload_progress(current: int, total: int, status_msg: Message, file_name: str, idx: int, total_items: int, last_update: list, start_time: float):
     current_time = time.time()
-    if current_time - last_update[0] < 4.0:
+    if current_time - last_update[0] < 4:
         return
     last_update[0] = current_time
 
-    if total == 0:
+    if total <= 0:
         return
 
     percent = int(current * 100 / total)
@@ -121,6 +122,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         logger.info(f"Processing: {url}")
         status_msg = await message.reply_text(f"🔄 Processing: {url[:60]}...")
 
+        # Normalize domain
         url = url.replace("bunkr.pk", "bunkr.su").replace("bunkr.is", "bunkr.su")
         if not url.startswith("https://"):
             url = "https://" + url.lstrip("/")
@@ -143,7 +145,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
 
         h1 = soup.find('h1', class_=['text-[20px]', 'truncate'])
         if h1:
-            album_name = h1.get_text(strip=True)
+            album_name = h1.get_text(strip=True) or "file"
 
         if is_direct_file_page:
             item = get_real_download_url(session, url, is_direct=True, name=album_name)
@@ -197,10 +199,11 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                     f.write(chunk)
                     downloaded += len(chunk)
                     await download_progress(
-                        downloaded, file_size, status_msg, file_name, idx, len(items),
-                        last_update, start_time
+                        downloaded, file_size, status_msg,
+                        file_name, idx, len(items), last_update, start_time
                     )
 
+            # Thumbnail for videos
             thumb_path = None
             if MOVIEPY_AVAILABLE and file_name.lower().endswith(('.mp4', '.mkv', '.mov', '.webm', '.avi')):
                 try:
@@ -258,9 +261,9 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         await safe_edit(status_msg, f"❌ Error: {str(e)[:120]}")
 
 # ────────────────────────────────────────────────
-#  FIXED LINE HERE
+#  FIXED: list your actual commands here
 # ────────────────────────────────────────────────
-@app.on_message(filters.text & ~filters.command())
+@app.on_message(filters.text & ~filters.command(["start", "help"]))
 async def handle_message(client: Client, message: Message):
     urls = extract_urls(message.text)
     if not urls:
