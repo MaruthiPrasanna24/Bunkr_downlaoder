@@ -1,263 +1,278 @@
+# telegram_bot.py
 import os
 import re
-import asyncio
 import time
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from dotenv import load_dotenv
+from pyrogram.errors import MessageNotModified
 import logging
-from dump import (
-    get_items_list,
-    create_session,
-    get_and_prepare_download_path,
-    get_real_download_url,
-    get_url_data
-)
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from tqdm import tqdm
-from pyrogram.errors import MessageNotModified
-from urllib.parse import urljoin
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+
+# ────────────────────────────────────────────────
+# Import scraper functions from dump.py
+# ────────────────────────────────────────────────
+from dump import (
+    create_session,
+    get_and_prepare_download_path,
+    get_real_download_url,
+    get_url_data,
+    remove_illegal_chars
+)
+
 try:
     from moviepy.editor import VideoFileClip
     MOVIEPY_AVAILABLE = True
 except ImportError:
     MOVIEPY_AVAILABLE = False
 
-load_dotenv()
-API_ID = int(os.getenv('TELEGRAM_API_ID'))
-API_HASH = os.getenv('TELEGRAM_API_HASH')
-BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-DOWNLOADS_DIR = os.getenv('DOWNLOADS_DIR', 'downloads')
+# ────────────────────────────────────────────────
+# Config & Logging
+# ────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 app = Client(
     "bunkr_downloader_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    api_id=int(os.getenv("TELEGRAM_API_ID")),
+    api_hash=os.getenv("TELEGRAM_API_HASH"),
+    bot_token=os.getenv("TELEGRAM_BOT_TOKEN")
 )
-URL_PATTERN = r'(https?://(?:bunkr\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la)|bunkrrr\.org|cyberdrop\.me)[^\s]+)'
+
+DOWNLOADS_DIR = os.getenv('DOWNLOADS_DIR', 'downloads')
+
+URL_PATTERN = r'(https?://(?:bunkr\.(?:is|su|la|ac|fi|ax|ci|ps|ph|si|is|pk|ru|cr|sk)|bunkrrr\.org|cyberdrop\.me)[^\s]+)'
+
 def extract_urls(text):
-    matches = re.findall(URL_PATTERN, text)
-    logger.info(f"[v0] URL_PATTERN matches: {matches}")
-    return matches
-def is_valid_bunkr_url(url):
-    is_valid = bool(
-        re.match(r'https?://(?:bunkr\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la)|bunkrrr\.org|cyberdrop\.me)', url)
-    )
-    logger.info(f"[v0] is_valid_bunkr_url({url}) = {is_valid}")
-    return is_valid
-async def safe_edit(msg, text):
-    """Safely edit Telegram message without crashing"""
+    return re.findall(URL_PATTERN, text, re.IGNORECASE)
+
+def is_valid_url(url):
+    return bool(re.match(URL_PATTERN, url, re.IGNORECASE))
+
+async def safe_edit(msg: Message, text: str):
     try:
         if msg.text != text:
             await msg.edit_text(text)
     except MessageNotModified:
         pass
     except Exception as e:
-        logger.warning(f"[v0] edit_text failed: {e}")
+        logger.warning(f"safe_edit failed: {e}")
+
 def human_bytes(size):
-    if size < 1024:
-        return f"{size} B"
-    elif size < 1024**2:
-        return f"{size / 1024:.2f} KB"
-    elif size < 1024**3:
-        return f"{size / 1024**2:.2f} MB"
-    else:
-        return f"{size / 1024**3:.2f} GB"
-# =======================
-# ✅ ADDED: UPLOAD PROGRESS WITH THROTTLING
-# =======================
-async def upload_progress(current, total, status_msg, file_name, idx, total_items, last_update_time, start_time):
-    if total == 0:
+    for unit in ['B','KiB','MiB','GiB','TiB']:
+        if size < 1024.0:
+            return f"{size:.2f} {unit}" if unit != 'B' else f"{int(size)} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} PiB"
+
+async def download_progress(curr, total, msg, fname, idx, total_files, last_t, stime):
+    now = time.time()
+    if now - last_t[0] < 5:
         return
-    current_time = time.time()
-    if current_time - last_update_time[0] < 5:
+    last_t[0] = now
+
+    if total <= 0:
         return
-    last_update_time[0] = current_time
-    percent = int(current * 100 / total)
-    elapsed = current_time - start_time
-    speed = current / elapsed if elapsed > 0 else 0
-    eta = (total - current) / speed if speed > 0 else 0
-    bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
-    text = (
-        f"📤 Uploading [{idx}/{total_items}]: {file_name[:25]}\n"
-        f"[{bar}] {percent}%\n"
-        f"{human_bytes(current)} / {human_bytes(total)}\n"
-        f"ETA: {int(eta // 60)}m {int(eta % 60)}s"
+
+    pct = int(curr * 100 / total)
+    elapsed = now - stime
+    speed = curr / elapsed if elapsed > 0 else 0
+    eta_sec = (total - curr) / speed if speed > 0 else 0
+
+    bar = '█' * (pct // 5) + '░' * (20 - (pct // 5))
+
+    txt = (
+        f"⬇️ [{idx}/{total_files}] {fname[:28]}\n"
+        f"[{bar}] {pct}%\n"
+        f"{human_bytes(curr)} / {human_bytes(total)}\n"
+        f"↑ {human_bytes(int(speed))}/s  •  ETA {int(eta_sec//60)}m {int(eta_sec%60)}s"
     )
-    await safe_edit(status_msg, text)
-async def download_and_send_file(client: Client, message: Message, url: str, session: requests.Session):
+    await safe_edit(msg, txt)
+
+async def upload_progress(curr, total, msg, fname, idx, total_files, last_t, stime):
+    now = time.time()
+    if now - last_t[0] < 5:
+        return
+    last_t[0] = now
+
+    if total <= 0:
+        return
+
+    pct = int(curr * 100 / total)
+    elapsed = now - stime
+    speed = curr / elapsed if elapsed > 0 else 0
+    eta_sec = (total - curr) / speed if speed > 0 else 0
+
+    bar = '█' * (pct // 5) + '░' * (20 - (pct // 5))
+
+    txt = (
+        f"📤 [{idx}/{total_files}] {fname[:28]}\n"
+        f"[{bar}] {pct}%\n"
+        f"{human_bytes(curr)} / {human_bytes(total)}\n"
+        f"↑ {human_bytes(int(speed))}/s  •  ETA {int(eta_sec//60)}m {int(eta_sec%60)}s"
+    )
+    await safe_edit(msg, txt)
+
+async def download_and_send_file(client: Client, message: Message, url: str):
+    status = None
     try:
-        logger.info(f"[v0] Starting download_and_send_file for: {url}")
-        status_msg = await message.reply_text(f"🔄 Processing: {url[:50]}...")
-        last_status = ""
-        is_bunkr = "bunkr" in url or "bunkrrr" in url
-        logger.info(f"[v0] is_bunkr: {is_bunkr}")
-        # Replace domain to a more reliable one to avoid connection issues
-        url = url.replace("bunkr.pk", "bunkr.su").replace("bunkr.is", "bunkr.su")  # Example replacement; adjust as needed
-        if is_bunkr and not url.startswith("https"):
-            url = f"https://bunkr.su{url}"
-        r = session.get(url, timeout=30)
+        status = await message.reply(f"🔄 Processing {url[:65]}{'…' if len(url)>65 else ''}")
+
+        # Normalize domain
+        url = re.sub(r'^http://', 'https://', url)
+        url = url.replace("bunkr.pk", "bunkr.su").replace("bunkr.is", "bunkr.su")
+
+        sess = create_session()
+        r = sess.get(url, timeout=25)
         if r.status_code != 200:
-            await safe_edit(status_msg, f"❌ HTTP {r.status_code}")
+            await safe_edit(status, f"❌ HTTP {r.status_code}")
             return
+
         soup = BeautifulSoup(r.content, 'html.parser')
-        is_direct = (
-            soup.find('span', {'class': 'ic-videos'}) is not None or
-            soup.find('div', {'class': 'lightgallery'}) is not None
+
+        is_single = bool(
+            soup.find('span', class_='ic-videos') or
+            soup.find('div', class_='lightgallery')
         )
+
         items = []
-        if is_direct:
-            h1 = soup.find('h1', {'class': 'text-[20px]'}) or soup.find('h1', {'class': 'truncate'})
-            album_name = h1.text if h1 else "file"
-            item = get_real_download_url(session, url, True, album_name)
-            if item:
-                items.append(item)
+        album_name = "download"
+
+        h1 = soup.find('h1', class_=['truncate', 'text-[20px]'])
+        if h1:
+            album_name = remove_illegal_chars(h1.get_text(strip=True))
+
+        if is_single:
+            dl_item = get_real_download_url(sess, url, item_name=album_name)
+            if dl_item:
+                items.append(dl_item)
         else:
-            h1 = soup.find('h1', {'class': 'truncate'})
-            album_name = h1.text if h1 else "album"
-            for theItem in soup.find_all('div', {'class': 'theItem'}):
-                box = theItem.find('a', {'class': 'after:absolute'})
-                if box:
-                    view_url = urljoin(url, box["href"])
-                    name = theItem.find("p").text if theItem.find("p") else "file"
-                    direct_item = get_real_download_url(session, view_url, True, name)
-                    if direct_item:
-                        items.append(direct_item)
+            for div in soup.find_all('div', class_='theItem'):
+                a = div.find('a', class_='after:absolute')
+                if not a:
+                    continue
+                view_url = urljoin(url, a['href'])
+                name = div.find('p')
+                name = name.get_text(strip=True) if name else "file"
+                dl_item = get_real_download_url(sess, view_url, item_name=name)
+                if dl_item:
+                    items.append(dl_item)
+
         if not items:
-            await safe_edit(status_msg, "❌ No downloadable items found")
+            await safe_edit(status, "❌ No files found")
             return
-        download_path = get_and_prepare_download_path(DOWNLOADS_DIR, album_name)
-        await safe_edit(status_msg, f"📥 Found {len(items)} items. Starting...")
-        for idx, item in enumerate(items, 1):
-            if isinstance(item, dict):
-                file_url = item.get("url")
-                file_name = item.get("name", album_name)
-            else:
-                file_url = item
-                file_name = album_name
-            await safe_edit(
-                status_msg,
-                f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:30]}"
-            )
-            response = session.get(file_url, stream=True, timeout=30)
-            if response.status_code != 200:
+
+        path = get_and_prepare_download_path(DOWNLOADS_DIR, album_name)
+        await safe_edit(status, f"Found {len(items)} file(s). Downloading...")
+
+        for i, item in enumerate(items, 1):
+            file_url = item['url'] if isinstance(item, dict) else item
+            fname = item.get('name', album_name) if isinstance(item, dict) else album_name
+
+            await safe_edit(status, f"⬇️ [{i}/{len(items)}] {fname[:32]} …")
+
+            r = sess.get(file_url, stream=True, timeout=45)
+            if r.status_code != 200:
+                await safe_edit(status, f"Download failed HTTP {r.status_code}")
                 continue
-            file_size = int(response.headers.get("content-length", 0))
-            final_path = os.path.join(download_path, file_name)
-            downloaded = 0
-            start_time = time.time()
-            last_update = start_time
-            with open(final_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    current_time = time.time()
-                    if current_time - last_update >= 5 and file_size > 0:
-                        percent = int((downloaded / file_size) * 100)
-                        elapsed = current_time - start_time
-                        speed = downloaded / elapsed if elapsed > 0 else 0
-                        eta = (file_size - downloaded) / speed if speed > 0 else 0
-                        bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
-                        text = (
-                            f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:25]}\n"
-                            f"[{bar}] {percent}%\n"
-                            f"{human_bytes(downloaded)} / {human_bytes(file_size)}\n"
-                            f"ETA: {int(eta // 60)}m {int(eta % 60)}s"
-                        )
-                        if text != last_status:
-                            await safe_edit(status_msg, text)
-                            last_status = text
-                        last_update = current_time
-            await safe_edit(
-                status_msg,
-                f"📤 Uploading [{idx}/{len(items)}]: {file_name[:30]}"
-            )
-            # Generate thumbnail for videos if moviepy is available
-            thumb_path = None
-            if MOVIEPY_AVAILABLE and file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
+
+            fsize = int(r.headers.get('content-length', 0))
+            out_path = os.path.join(path, fname)
+
+            curr = 0
+            st = time.time()
+            last = [st]
+
+            with open(out_path, 'wb') as f:
+                for chunk in r.iter_content(16384):
+                    if chunk:
+                        f.write(chunk)
+                        curr += len(chunk)
+                        await download_progress(curr, fsize, status, fname, i, len(items), last, st)
+
+            # thumbnail
+            thumb = None
+            if MOVIEPY_AVAILABLE and fname.lower().endswith(('.mp4','.mkv','.webm','.mov','.avi')):
                 try:
-                    thumb_path = os.path.join(download_path, f"{file_name}_thumb.jpg")
-                    clip = VideoFileClip(final_path)
-                    clip.save_frame(thumb_path, t=1)  # Extract frame at 1 second
+                    thumb = os.path.join(path, f"thumb_{fname}.jpg")
+                    clip = VideoFileClip(out_path)
+                    clip.save_frame(thumb, t=1.8)
+                    clip.close()
                 except Exception as e:
-                    logger.warning(f"Thumbnail generation failed: {e}")
-                    thumb_path = None
-            upload_start_time = time.time()
-            last_update_time = [upload_start_time]  # Mutable list for throttling
-            with open(final_path, "rb") as f:
-                if file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
+                    logger.warning(f"thumb failed: {e}")
+                    thumb = None
+
+            # upload
+            await safe_edit(status, f"📤 Uploading [{i}/{len(items)}] {fname[:32]} …")
+
+            ust = time.time()
+            ulast = [ust]
+
+            with open(out_path, 'rb') as f:
+                if fname.lower().endswith(('.mp4','.mkv','.webm','.mov','.avi')):
                     await client.send_video(
-                        message.chat.id,
-                        f,
-                        caption=f"✅ {file_name}",
-                        thumb=thumb_path,
+                        message.chat.id, f,
+                        caption=f"**{fname}**",
+                        thumb=thumb,
                         progress=upload_progress,
-                        progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
+                        progress_args=(status, fname, i, len(items), ulast, ust)
                     )
-                elif file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
+                elif fname.lower().endswith(('.jpg','.jpeg','.png','.gif','.webp')):
                     await client.send_photo(
-                        message.chat.id,
-                        f,
-                        caption=f"✅ {file_name}",
+                        message.chat.id, f,
+                        caption=f"**{fname}**",
                         progress=upload_progress,
-                        progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
+                        progress_args=(status, fname, i, len(items), ulast, ust)
                     )
                 else:
                     await client.send_document(
-                        message.chat.id,
-                        f,
-                        caption=f"✅ {file_name}",
+                        message.chat.id, f,
+                        caption=f"**{fname}**",
                         progress=upload_progress,
-                        progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
+                        progress_args=(status, fname, i, len(items), ulast, ust)
                     )
-            os.remove(final_path)
-            if thumb_path and os.path.exists(thumb_path):
-                os.remove(thumb_path)
-        await safe_edit(status_msg, f"✅ Done! {album_name}")
+
+            try:
+                os.remove(out_path)
+                if thumb and os.path.exists(thumb):
+                    os.remove(thumb)
+            except:
+                pass
+
+        await safe_edit(status, f"**Done** — {album_name} ({len(items)} files)")
+
     except Exception as e:
         logger.exception(e)
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
-@app.on_message(filters.text)
-async def handle_message(client: Client, message: Message):
+        txt = f"❌ Error: {str(e)[:200]}"
+        if status:
+            await safe_edit(status, txt)
+        else:
+            await message.reply(txt)
+
+@app.on_message(filters.text & ~filters.command)
+async def on_text(client, message: Message):
     urls = extract_urls(message.text)
     if not urls:
         return
-    session = create_session()
-    # Add retries to session to fix connection reset errors
-    retry_strategy = Retry(
-        total=5,
-        backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
+
     for url in urls:
-        if is_valid_bunkr_url(url):
-            await download_and_send_file(client, message, url, session)
+        if is_valid_url(url):
+            await download_and_send_file(client, message, url)
+
 @app.on_message(filters.command("start"))
-async def start_command(client: Client, message: Message):
-    await message.reply_text(
-        "🤖 **Bunkr Downloader Bot**\n\n"
-        "Send Bunkr or Cyberdrop links.\n"
-        "The bot will download & upload automatically."
-    )
+async def cmd_start(_, m):
+    await m.reply("**Bunkr / Cyberdrop Downloader Bot**\n\nSend link(s) to download & upload here.")
+
 @app.on_message(filters.command("help"))
-async def help_command(client: Client, message: Message):
-    await message.reply_text(
-        "Send any Bunkr / Cyberdrop link.\n"
-        "Progress updates + auto upload supported."
-    )
-def start_bot():
-    logger.info("Bot starting...")
+async def cmd_help(_, m):
+    await m.reply("Just send bunkr or cyberdrop link(s).\nBot will process albums and single files.")
+
+def run_bot():
+    logger.info("Telegram bot is running...")
     app.run()
+
 if __name__ == "__main__":
-    start_bot()
+    run_bot()
