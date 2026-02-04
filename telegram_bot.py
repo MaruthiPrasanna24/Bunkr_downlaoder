@@ -27,20 +27,14 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 if not all([API_ID_STR, API_HASH, BOT_TOKEN]):
     logger.error("Missing required environment variables!")
-    logger.error("Required: TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_BOT_TOKEN")
     raise ValueError("Missing environment variables")
 
-try:
-    API_ID = int(API_ID_STR)
-except ValueError:
-    logger.error(f"TELEGRAM_API_ID must be an integer, got: {API_ID_STR}")
-    raise ValueError("Invalid TELEGRAM_API_ID format")
+API_ID = int(API_ID_STR)
 
 DOWNLOADS_DIR = os.getenv("DOWNLOADS_DIR", "downloads")
 
 if not os.path.exists(DOWNLOADS_DIR):
     os.makedirs(DOWNLOADS_DIR)
-    logger.info(f"Created downloads directory: {DOWNLOADS_DIR}")
 
 _session = None
 
@@ -61,21 +55,18 @@ URL_PATTERN = r"(https?://(?:bunkr\.(?:sk|cr|ru|su|pk|is|me|so|re|cat|dog|xxx)|c
 
 def extract_urls(text):
     matches = re.findall(URL_PATTERN, text)
-    logger.info(f"[v0] URL_PATTERN matches: {matches}")
-    cleaned_matches = []
+    cleaned = []
     for url in matches:
-        url = url.rstrip('.,!?;:)')
+        url = url.rstrip('.,!?;)')
         if url:
-            cleaned_matches.append(url)
-    logger.info(f"[v0] Cleaned URLs: {cleaned_matches}")
-    return cleaned_matches
+            cleaned.append(url)
+    return cleaned
 
 def is_valid_bunkr_url(url):
-    is_valid = bool(
-        re.match(r"https?://(?:bunkr\.(?:sk|cr|ru|su|pk|is|me|so|re|cat|dog|xxx)|cyberdrop\.(?:me|io|to|cc))", url)
-    )
-    logger.info(f"[v0] is_valid_bunkr_url({url}) = {is_valid}")
-    return is_valid
+    return bool(re.match(
+        r"https?://(?:bunkr\.(?:sk|cr|ru|su|pk|is|me|so|re|cat|dog|xxx)|cyberdrop\.(?:me|io|to|cc))",
+        url
+    ))
 
 async def safe_edit(msg, text):
     try:
@@ -83,8 +74,6 @@ async def safe_edit(msg, text):
             await msg.edit_text(text)
     except MessageNotModified:
         pass
-    except Exception as e:
-        logger.warning(f"edit failed: {e}")
 
 async def upload_progress(current, total, status_msg, file_name, idx, total_items):
     if total == 0:
@@ -92,65 +81,52 @@ async def upload_progress(current, total, status_msg, file_name, idx, total_item
     percent = int(current * 100 / total)
     await safe_edit(
         status_msg,
-        f"📤 Uploading [{idx}/{total_items}]: {file_name[:25]}\n"
-        f"Progress: {percent}%"
+        f"📤 Uploading [{idx}/{total_items}]: {file_name[:25]}\nProgress: {percent}%"
     )
 
 async def download_and_send_file(client: Client, message: Message, url: str, session: requests.Session):
     try:
-        logger.info(f"[v0] Starting download_and_send_file for: {url}")
-        status_msg = await message.reply_text(f"🔄 Processing: {url[:50]}...")
-
-        if "bunkr" in url and not url.startswith("https"):
-            url = "https://bunkr.cr" + url
+        status_msg = await message.reply_text("🔄 Processing link...")
 
         r = session.get(url, timeout=30)
-        logger.info(f"[v0] Response status: {r.status_code}")
-
         if r.status_code != 200:
-            await safe_edit(status_msg, f"❌ HTTP {r.status_code}")
+            await safe_edit(status_msg, "❌ Failed to fetch page")
             return
 
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(r.content, "html.parser")
 
-        is_direct = soup.find("div", {"class": "lightgallery"}) or soup.find("span", {"class": "ic-videos"})
-
         items = []
-        processed_urls = set()
+        processed = set()
 
-        if is_direct:
-            h1 = soup.find("h1", {"class": "truncate"})
-            album_name = h1.text if h1 else "file"
+        h1 = soup.find("h1", {"class": "truncate"})
+        album_name = h1.text if h1 else "bunkr"
+
+        for theItem in soup.find_all("div", {"class": "theItem"}):
+            box = theItem.find("a", {"class": "after:absolute"})
+            if box:
+                item_url = box["href"]
+                if item_url not in processed:
+                    processed.add(item_url)
+                    items.append({
+                        "url": item_url,
+                        "name": theItem.find("p").text if theItem.find("p") else "file"
+                    })
+
+        if not items:
             item = get_real_download_url(session, url, True, album_name)
             if item:
                 items.append(item)
-        else:
-            for theItem in soup.find_all("div", {"class": "theItem"}):
-                box = theItem.find("a", {"class": "after:absolute"})
-                if box:
-                    item_url = box["href"]
-                    if item_url not in processed_urls:
-                        processed_urls.add(item_url)
-                        items.append({
-                            "url": item_url,
-                            "name": theItem.find("p").text if theItem.find("p") else "file"
-                        })
-            h1 = soup.find("h1", {"class": "truncate"})
-            album_name = h1.text if h1 else "album"
 
         if not items:
-            await safe_edit(status_msg, "❌ No items found")
+            await safe_edit(status_msg, "❌ No downloadable items found")
             return
 
         from dump import remove_illegal_chars
         album_name = remove_illegal_chars(album_name)
         download_path = os.path.join(DOWNLOADS_DIR, album_name)
 
-        if not os.path.exists(download_path):
-            os.makedirs(download_path)
-
-        await safe_edit(status_msg, f"📥 Found {len(items)} items")
+        os.makedirs(download_path, exist_ok=True)
 
         for idx, item in enumerate(items, 1):
             file_url = item["url"] if isinstance(item, dict) else item
@@ -160,17 +136,16 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 file_url = "https://bunkr.cr" + file_url
 
             file_name = remove_illegal_chars(file_name)
-
-            await safe_edit(status_msg, f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:30]}")
-
-            response = session.get(file_url, stream=True, timeout=30)
-            if response.status_code != 200:
-                continue
-
             final_path = os.path.join(download_path, file_name)
 
+            await safe_edit(status_msg, f"⬇️ Downloading {file_name[:30]}")
+
+            resp = session.get(file_url, stream=True)
+            if resp.status_code != 200:
+                continue
+
             with open(final_path, "wb") as f:
-                for chunk in response.iter_content(8192):
+                for chunk in resp.iter_content(8192):
                     if chunk:
                         f.write(chunk)
 
@@ -181,23 +156,29 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             else:
                 await client.send_document(message.chat.id, final_path, caption=f"✅ {file_name}")
 
-            if os.path.exists(final_path):
-                os.remove(final_path)
+            os.remove(final_path)
 
-        await safe_edit(status_msg, f"✅ Done! {album_name}")
+        await safe_edit(status_msg, "✅ Done")
 
     except Exception as e:
         logger.exception(e)
-        await message.reply_text(f"❌ Error: {str(e)[:120]}")
+        await message.reply_text("❌ Error during download")
 
-# ✅ FIXED HANDLER (ONLY CHANGE HERE)
+# 🔥 FULLY FIXED MESSAGE HANDLER
 @app.on_message(filters.text | filters.caption)
 async def handle_message(client: Client, message: Message):
     try:
-        text = message.text or message.caption
-        logger.info(f"[v0] Received message from {message.chat.id}: {text[:100]}")
+        text = message.text or message.caption or ""
 
-        if text.startswith('/'):
+        # 🔥 NEW: extract URLs from entities (preview-only messages)
+        if message.entities:
+            for ent in message.entities:
+                if ent.type == "url":
+                    text += " " + message.text[ent.offset: ent.offset + ent.length]
+                elif ent.type == "text_link":
+                    text += " " + ent.url
+
+        if not text or text.startswith("/"):
             return
 
         urls = extract_urls(text)
@@ -205,33 +186,34 @@ async def handle_message(client: Client, message: Message):
             return
 
         session = get_global_session()
-        processed_urls = set()
+        processed = set()
 
         for url in urls:
-            if url in processed_urls:
+            if url in processed:
                 continue
-            processed_urls.add(url)
+            processed.add(url)
 
             if is_valid_bunkr_url(url):
                 await download_and_send_file(client, message, url, session)
 
     except Exception as e:
-        logger.exception(f"[v0] Error in handle_message: {e}")
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+        logger.exception(e)
+        await message.reply_text("❌ Internal error")
 
 @app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
     await message.reply_text(
         "🤖 Bunkr Downloader Bot\n\n"
-        "Send Bunkr or Cyberdrop links.\n"
-        "Albums supported."
+        "Send Bunkr / Cyberdrop links.\n"
+        "Preview links supported."
     )
 
 @app.on_message(filters.command("help"))
 async def help_command(client: Client, message: Message):
-    await message.reply_text("Send a link.")
+    await message.reply_text("Just send a link.")
 
 def start_bot():
+    logger.info("Bot starting…")
     app.run()
 
 if __name__ == "__main__":
