@@ -15,6 +15,8 @@ from dump import (
 import requests
 from tqdm import tqdm
 from pyrogram.errors import MessageNotModified
+from urllib.parse import urljoin
+from bs4 import BeautifulSoup
 
 load_dotenv()
 
@@ -33,7 +35,7 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-URL_PATTERN = r'(https?://(?:bunkr\.(?:sk|cr|ru|su|pk|is)|cyberdrop\.me)[^\s]+)'
+URL_PATTERN = r'(https?://(?:bunkr\.(?:sk|cr|ru|su|pk|is|la|fi|ws|pm|to|li|ci|vc|cx|ac|lv|nu|red)|cyberdrop\.me)[^\s]+)'
 
 
 def extract_urls(text):
@@ -44,7 +46,7 @@ def extract_urls(text):
 
 def is_valid_bunkr_url(url):
     is_valid = bool(
-        re.match(r'https?://(?:bunkr\.(?:sk|cr|ru|su|pk|is)|cyberdrop\.me)', url)
+        re.match(r'https?://(?:bunkr\.(?:sk|cr|ru|su|pk|is|la|fi|ws|pm|to|li|ci|vc|cx|ac|lv|nu|red)|cyberdrop\.me)', url)
     )
     logger.info(f"[v0] is_valid_bunkr_url({url}) = {is_valid}")
     return is_valid
@@ -85,14 +87,13 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         logger.info(f"[v0] is_bunkr: {is_bunkr}")
 
         if is_bunkr and not url.startswith("https"):
-            url = f"https://bunkr.sk{url}"
+            url = f"https://{url}"
 
         r = session.get(url, timeout=30)
         if r.status_code != 200:
             await safe_edit(status_msg, f"❌ HTTP {r.status_code}")
             return
 
-        from bs4 import BeautifulSoup
         soup = BeautifulSoup(r.content, 'html.parser')
 
         is_direct = (
@@ -109,13 +110,18 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             if item:
                 items.append(item)
         else:
+            items = []
             for theItem in soup.find_all('div', {'class': 'theItem'}):
                 box = theItem.find('a', {'class': 'after:absolute'})
                 if box:
-                    items.append({
-                        "url": box["href"],
-                        "name": theItem.find("p").text if theItem.find("p") else "file"
-                    })
+                    item_url = urljoin(url, box["href"])
+                    name = theItem.find("p").text if theItem.find("p") else "file"
+                    real_url = get_real_download_url(session, item_url, True, name)
+                    if real_url:
+                        items.append({
+                            "url": real_url,
+                            "name": name
+                        })
             h1 = soup.find('h1', {'class': 'truncate'})
             album_name = h1.text if h1 else "album"
 
