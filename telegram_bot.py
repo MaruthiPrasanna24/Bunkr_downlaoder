@@ -108,62 +108,53 @@ def fix_bunkr_url(url: str) -> str:
     url = url.replace("c.bunkr-cache.se", "c.bunkr.su")
     url = url.replace("bunkr-cache.se", "bunkr.su")
     url = url.replace("c.bunkr.is", "c.bunkr.su")
-    url = url.replace("bunkr.media", "bunkr.su")
-    url = url.replace("bunkr.red", "bunkr.su")
     return url
 
-async def generate_video_thumbnail_and_duration(video_path: str, output_path: str) -> tuple[bool, int]:
+async def generate_video_thumbnail(video_path: str, output_path: str) -> bool:
     """
-    Try to generate thumbnail and get duration using moviepy or opencv
-    Returns (success, duration)
+    Try to generate thumbnail using moviepy or opencv
+    Returns True if successful, False otherwise
     """
-    success = False
-    duration = 0
-
     if MOVIEPY_AVAILABLE:
         try:
             clip = VideoFileClip(video_path)
-            duration = int(clip.duration)
             clip.save_frame(output_path, t=1)
             clip.close()
-            success = True
+            return True
         except Exception as e:
-            logger.warning(f"MoviePy failed: {e}")
+            logger.warning(f"MoviePy thumbnail failed: {e}")
 
-    if not success and OPENCV_AVAILABLE:
+    if OPENCV_AVAILABLE:
         try:
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
                 logger.warning("Cannot open video with OpenCV")
-                return False, 0
-
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            if fps > 0:
-                duration = int(frame_count / fps)
+                return False
 
             # Try to get frame at ~1 second
+            fps = cap.get(cv2.CAP_PROP_FPS)
             frame_pos = int(fps * 1) if fps > 0 else 30
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
+
             ret, frame = cap.read()
             if ret:
                 cv2.imwrite(output_path, frame)
-                success = True
+                cap.release()
+                return True
             else:
-                # Fallback to first frame
+                # Fallback: try first frame
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ret, frame = cap.read()
                 if ret:
                     cv2.imwrite(output_path, frame)
-                    success = True
-            cap.release()
+                    cap.release()
+                    return True
+                cap.release()
         except Exception as e:
-            logger.warning(f"OpenCV failed: {e}")
+            logger.warning(f"OpenCV thumbnail failed: {e}")
 
-    if not success:
-        logger.warning("No thumbnail/duration extracted")
-
-    return success, duration
+    logger.warning("No thumbnail generated - neither moviepy nor opencv worked")
+    return False
 
 async def download_and_send_file(client: Client, message: Message, url: str, session: requests.Session):
     try:
@@ -173,24 +164,13 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         is_bunkr = "bunkr" in url or "bunkrrr" in url
         logger.info(f"[v0] is_bunkr: {is_bunkr}")
 
-        # Enhanced domain fallback for album URL
-        url = fix_bunkr_url(url)
+        url = url.replace("bunkr.pk", "bunkr.su").replace("bunkr.is", "bunkr.su")
         if is_bunkr and not url.startswith("https"):
             url = f"https://bunkr.su{url}"
 
-        # Try fetching album with fallback domains if 404
-        domains_to_try = ['bunkr.su', 'bunkr.red', 'bunkr.is']
-        r = None
-        for domain in domains_to_try:
-            try_url = url.replace('bunkr.media', domain)  # Example replacement
-            r = session.get(try_url, timeout=30)
-            if r.status_code == 200:
-                url = try_url  # Update to working URL
-                break
-            logger.warning(f"Failed domain {domain} with {r.status_code}")
-
-        if not r or r.status_code != 200:
-            await safe_edit(status_msg, f"❌ HTTP {r.status_code if r else 'Failed all domains'} on album page")
+        r = session.get(url, timeout=30)
+        if r.status_code != 200:
+            await safe_edit(status_msg, f"❌ HTTP {r.status_code} on album page")
             return
 
         soup = BeautifulSoup(r.content, 'html.parser')
@@ -311,14 +291,13 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                     os.remove(final_path)
                 continue
 
-            # Thumbnail and duration extraction
+            # Thumbnail generation
             thumb_path = None
-            video_duration = 0
             if file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
                 thumb_filename = f"{file_name}_thumb.jpg"
                 thumb_path = os.path.join(download_path, thumb_filename)
 
-                success, video_duration = await generate_video_thumbnail_and_duration(final_path, thumb_path)
+                success = await generate_video_thumbnail(final_path, thumb_path)
                 if not success or not os.path.exists(thumb_path):
                     logger.warning(f"Thumbnail not created for {file_name}")
                     thumb_path = None
@@ -339,7 +318,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             f,
                             caption=f"✅ {file_name}",
                             thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
-                            duration=video_duration,
                             progress=upload_progress,
                             progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         )
@@ -383,11 +361,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
 
 @app.on_message(filters.text)
 async def handle_message(client: Client, message: Message):
-    # Anti-flood: ignore messages sent by the bot itself to prevent loops
-    bot = await client.get_me()
-    if message.from_user and message.from_user.id == bot.id:
-        return
-
     urls = extract_urls(message.text)
     if not urls:
         return
