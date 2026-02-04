@@ -8,3 +8,7 @@ pyrogram==2.0.106
 tgcrypto==1.2.5
 python-dotenv==1.0.0
 flask==3.0.0
+
+# ──────────────── added for video thumbnails ────────────────
+opencv-python>=4.8.0
+# moviepy>=1.0.3     # ← uncomment if you prefer moviepy instead
