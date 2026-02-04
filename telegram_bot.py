@@ -2,7 +2,6 @@ import os
 import re
 import asyncio
 import time
-import socket
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from dotenv import load_dotenv
@@ -19,10 +18,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from tqdm import tqdm
 from pyrogram.errors import MessageNotModified
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
-from requests.exceptions import ConnectionError
-from urllib3.exceptions import NameResolutionError
 
 try:
     from moviepy.editor import VideoFileClip
@@ -30,18 +27,11 @@ try:
 except ImportError:
     MOVIEPY_AVAILABLE = False
 
-# =========================
-# 🔥 ADDED: FORCE IPV4 (DNS FIX)
-# =========================
-orig_getaddrinfo = socket.getaddrinfo
-def force_ipv4(*args, **kwargs):
-    return orig_getaddrinfo(*args, **kwargs, family=socket.AF_INET)
-socket.getaddrinfo = force_ipv4
-
 load_dotenv()
+
 API_ID = int(os.getenv('TELEGRAM_API_ID'))
 API_HASH = os.getenv('TELEGRAM_API_HASH')
-BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+BOT_TOKEN = os.getenv('BOT_TOKEN')
 DOWNLOADS_DIR = os.getenv('DOWNLOADS_DIR', 'downloads')
 
 logging.basicConfig(level=logging.INFO)
@@ -90,80 +80,196 @@ def human_bytes(size):
 async def upload_progress(current, total, status_msg, file_name, idx, total_items, last_update_time, start_time):
     if total == 0:
         return
-    now = time.time()
-    if now - last_update_time[0] < 5:
+    current_time = time.time()
+    if current_time - last_update_time[0] < 5:
         return
-    last_update_time[0] = now
-
+    last_update_time[0] = current_time
     percent = int(current * 100 / total)
-    speed = current / (now - start_time) if now > start_time else 0
-    eta = (total - current) / speed if speed else 0
+    elapsed = current_time - start_time
+    speed = current / elapsed if elapsed > 0 else 0
+    eta = (total - current) / speed if speed > 0 else 0
     bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
-
-    await safe_edit(
-        status_msg,
+    text = (
         f"📤 Uploading [{idx}/{total_items}]: {file_name[:25]}\n"
         f"[{bar}] {percent}%\n"
         f"{human_bytes(current)} / {human_bytes(total)}\n"
         f"ETA: {int(eta // 60)}m {int(eta % 60)}s"
     )
+    await safe_edit(status_msg, text)
 
-# =========================
-# 🔥 ADDED: SAFE FILE DOWNLOAD
-# =========================
-def fix_bunkr_cdn(url):
-    parsed = urlparse(url)
-    if "bunkr-cache" in parsed.netloc or "b-cache" in parsed.netloc:
-        return url.replace(parsed.netloc, "media.bunkr.su")
+# ======================= CRITICAL FIX FUNCTION =======================
+def fix_bunkr_url(url: str) -> str:
+    """Fix unstable Bunkr CDN domains"""
+    url = url.replace("c.bunkr-cache.se", "c.bunkr.su")
+    url = url.replace("bunkr-cache.se", "bunkr.su")
+    url = url.replace("c.bunkr.is", "c.bunkr.su")
     return url
 
+# =====================================================================
+
 async def download_and_send_file(client: Client, message: Message, url: str, session: requests.Session):
-    status_msg = await message.reply_text(f"🔄 Processing: {url[:50]}...")
     try:
+        logger.info(f"[v0] Starting download_and_send_file for: {url}")
+        status_msg = await message.reply_text(f"🔄 Processing: {url[:50]}...")
+        last_status = ""
+        is_bunkr = "bunkr" in url or "bunkrrr" in url
+        logger.info(f"[v0] is_bunkr: {is_bunkr}")
+
+        url = url.replace("bunkr.pk", "bunkr.su").replace("bunkr.is", "bunkr.su")
+        if is_bunkr and not url.startswith("https"):
+            url = f"https://bunkr.su{url}"
+
         r = session.get(url, timeout=30)
         if r.status_code != 200:
             await safe_edit(status_msg, f"❌ HTTP {r.status_code}")
             return
 
         soup = BeautifulSoup(r.content, 'html.parser')
+        is_direct = (
+            soup.find('span', {'class': 'ic-videos'}) is not None or
+            soup.find('div', {'class': 'lightgallery'}) is not None
+        )
         items = []
+        if is_direct:
+            h1 = soup.find('h1', {'class': 'text-[20px]'}) or soup.find('h1', {'class': 'truncate'})
+            album_name = h1.text if h1 else "file"
+            item = get_real_download_url(session, url, True, album_name)
+            if item:
+                items.append(item)
+        else:
+            h1 = soup.find('h1', {'class': 'truncate'})
+            album_name = h1.text if h1 else "album"
+            for theItem in soup.find_all('div', {'class': 'theItem'}):
+                box = theItem.find('a', {'class': 'after:absolute'})
+                if box:
+                    view_url = urljoin(url, box["href"])
+                    name = theItem.find("p").text if theItem.find("p") else "file"
+                    direct_item = get_real_download_url(session, view_url, True, name)
+                    if direct_item:
+                        items.append(direct_item)
 
-        for theItem in soup.find_all('div', {'class': 'theItem'}):
-            box = theItem.find('a', {'class': 'after:absolute'})
-            if box:
-                view_url = urljoin(url, box["href"])
-                name = theItem.find("p").text if theItem.find("p") else "file"
-                item = get_real_download_url(session, view_url, True, name)
-                if item:
-                    items.append(item)
+        if not items:
+            await safe_edit(status_msg, "❌ No downloadable items found")
+            return
 
-        download_path = get_and_prepare_download_path(DOWNLOADS_DIR, "album")
-        await safe_edit(status_msg, f"📥 Found {len(items)} items")
+        download_path = get_and_prepare_download_path(DOWNLOADS_DIR, album_name)
+        await safe_edit(status_msg, f"📥 Found {len(items)} items. Starting...")
 
         for idx, item in enumerate(items, 1):
-            try:
-                file_url = fix_bunkr_cdn(item["url"])
-                file_name = item["name"]
+            if isinstance(item, dict):
+                file_url = item.get("url")
+                file_name = item.get("name", album_name)
+            else:
+                file_url = item
+                file_name = album_name
 
-                response = session.get(file_url, stream=True, timeout=30)
-                if response.status_code != 200:
-                    raise ConnectionError("Bad status")
+            # ==================== CRITICAL FIX ====================
+            file_url = fix_bunkr_url(file_url)
+            
+            await safe_edit(
+                status_msg,
+                f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:30]}"
+            )
 
-                final_path = os.path.join(download_path, file_name)
-                with open(final_path, "wb") as f:
-                    for chunk in response.iter_content(8192):
-                        if chunk:
-                            f.write(chunk)
+            # Retry logic + proper headers
+            max_retries = 4
+            for attempt in range(max_retries):
+                try:
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Referer": "https://bunkr.su/"
+                    }
+                    response = session.get(file_url, stream=True, timeout=60, headers=headers)
+                    if response.status_code == 200:
+                        break
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    await asyncio.sleep(2 ** attempt)
 
-                await client.send_document(message.chat.id, final_path, caption=f"✅ {file_name}")
-                os.remove(final_path)
-
-            except (ConnectionError, NameResolutionError, socket.gaierror) as e:
-                logger.error(f"SKIPPED FILE: {file_name} | {e}")
-                await safe_edit(status_msg, f"⚠️ Skipped broken file: {file_name}")
+            if response.status_code != 200:
+                await safe_edit(status_msg, f"❌ Failed to download {file_name}")
                 continue
 
-        await safe_edit(status_msg, "✅ Album completed")
+            file_size = int(response.headers.get("content-length", 0))
+            final_path = os.path.join(download_path, file_name)
+            downloaded = 0
+            start_time = time.time()
+            last_update = start_time
+
+            with open(final_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    current_time = time.time()
+                    if current_time - last_update >= 5 and file_size > 0:
+                        percent = int((downloaded / file_size) * 100)
+                        elapsed = current_time - start_time
+                        speed = downloaded / elapsed if elapsed > 0 else 0
+                        eta = (file_size - downloaded) / speed if speed > 0 else 0
+                        bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
+                        text = (
+                            f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:25]}\n"
+                            f"[{bar}] {percent}%\n"
+                            f"{human_bytes(downloaded)} / {human_bytes(file_size)}\n"
+                            f"ETA: {int(eta // 60)}m {int(eta % 60)}s"
+                        )
+                        if text != last_status:
+                            await safe_edit(status_msg, text)
+                            last_status = text
+                        last_update = current_time
+
+            await safe_edit(
+                status_msg,
+                f"📤 Uploading [{idx}/{len(items)}]: {file_name[:30]}"
+            )
+
+            thumb_path = None
+            if MOVIEPY_AVAILABLE and file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
+                try:
+                    thumb_path = os.path.join(download_path, f"{file_name}_thumb.jpg")
+                    clip = VideoFileClip(final_path)
+                    clip.save_frame(thumb_path, t=1)
+                except Exception as e:
+                    logger.warning(f"Thumbnail generation failed: {e}")
+                    thumb_path = None
+
+            upload_start_time = time.time()
+            last_update_time = [upload_start_time]
+            with open(final_path, "rb") as f:
+                if file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
+                    await client.send_video(
+                        message.chat.id,
+                        f,
+                        caption=f"✅ {file_name}",
+                        thumb=thumb_path,
+                        progress=upload_progress,
+                        progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
+                    )
+                elif file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
+                    await client.send_photo(
+                        message.chat.id,
+                        f,
+                        caption=f"✅ {file_name}",
+                        progress=upload_progress,
+                        progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
+                    )
+                else:
+                    await client.send_document(
+                        message.chat.id,
+                        f,
+                        caption=f"✅ {file_name}",
+                        progress=upload_progress,
+                        progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
+                    )
+
+            os.remove(final_path)
+            if thumb_path and os.path.exists(thumb_path):
+                os.remove(thumb_path)
+
+        await safe_edit(status_msg, f"✅ Done! {album_name}")
 
     except Exception as e:
         logger.exception(e)
@@ -174,11 +280,10 @@ async def handle_message(client: Client, message: Message):
     urls = extract_urls(message.text)
     if not urls:
         return
-
     session = create_session()
     retry_strategy = Retry(
-        total=5,
-        backoff_factor=1,
+        total=7,
+        backoff_factor=1.5,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
     )
@@ -195,7 +300,14 @@ async def start_command(client: Client, message: Message):
     await message.reply_text(
         "🤖 **Bunkr Downloader Bot**\n\n"
         "Send Bunkr or Cyberdrop links.\n"
-        "Auto download + upload."
+        "The bot will download & upload automatically."
+    )
+
+@app.on_message(filters.command("help"))
+async def help_command(client: Client, message: Message):
+    await message.reply_text(
+        "Send any Bunkr / Cyberdrop link.\n"
+        "Progress updates + auto upload supported."
     )
 
 def start_bot():
