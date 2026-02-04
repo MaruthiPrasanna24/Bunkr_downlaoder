@@ -27,6 +27,12 @@ try:
 except ImportError:
     MOVIEPY_AVAILABLE = False
 
+try:
+    import cv2
+    OPENCV_AVAILABLE = True
+except ImportError:
+    OPENCV_AVAILABLE = False
+
 load_dotenv()
 
 API_ID = int(os.getenv('TELEGRAM_API_ID'))
@@ -37,18 +43,14 @@ DOWNLOADS_DIR = os.getenv('DOWNLOADS_DIR', 'downloads')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ────────────────────────────────────────────────
-#           SAFER CLIENT INITIALIZATION
-# ────────────────────────────────────────────────
 app = Client(
     "bunkr_downloader_bot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN,                # This should prevent user-mode login
-    # Force no interactive prompts (important on Render / headless env)
+    bot_token=BOT_TOKEN
 )
 
-URL_PATTERN = r'(https?://(?:bunkr\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la)|bunkrrr\.org|cyberdrop\.me)[^\s]+)'
+URL_PATTERN = r'(https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|net|to)|bunkrrr\.org|cyberdrop\.(?:me|cr|to|cc|nl))[^\s]+)'
 
 def extract_urls(text):
     matches = re.findall(URL_PATTERN, text)
@@ -57,7 +59,7 @@ def extract_urls(text):
 
 def is_valid_bunkr_url(url):
     is_valid = bool(
-        re.match(r'https?://(?:bunkr\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la)|bunkrrr\.org|cyberdrop\.me)', url)
+        re.match(r'https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|net|to)|bunkrrr\.org|cyberdrop\.(?:me|cr|to|cc|nl))', url)
     )
     logger.info(f"[v0] is_valid_bunkr_url({url}) = {is_valid}")
     return is_valid
@@ -82,6 +84,9 @@ def human_bytes(size):
     else:
         return f"{size / 1024**3:.2f} GB"
 
+# =======================
+# ✅ ADDED: UPLOAD PROGRESS WITH THROTTLING
+# =======================
 async def upload_progress(current, total, status_msg, file_name, idx, total_items, last_update_time, start_time):
     if total == 0:
         return
@@ -116,16 +121,14 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         last_status = ""
         is_bunkr = "bunkr" in url or "bunkrrr" in url
         logger.info(f"[v0] is_bunkr: {is_bunkr}")
-
-        url = url.replace("bunkr.pk", "bunkr.su").replace("bunkr.is", "bunkr.su")
+        # Replace domain to a more reliable one to avoid connection issues
+        url = url.replace("bunkr.pk", "bunkr.su").replace("bunkr.is", "bunkr.su") # Example replacement; adjust as needed
         if is_bunkr and not url.startswith("https"):
             url = f"https://bunkr.su{url}"
-
         r = session.get(url, timeout=30)
         if r.status_code != 200:
-            await safe_edit(status_msg, f"❌ HTTP {r.status_code} on album page")
+            await safe_edit(status_msg, f"❌ HTTP {r.status_code}")
             return
-
         soup = BeautifulSoup(r.content, 'html.parser')
         is_direct = (
             soup.find('span', {'class': 'ic-videos'}) is not None or
@@ -149,16 +152,12 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                     direct_item = get_real_download_url(session, view_url, True, name)
                     if direct_item:
                         items.append(direct_item)
-
         if not items:
             await safe_edit(status_msg, "❌ No downloadable items found")
             return
-
         download_path = get_and_prepare_download_path(DOWNLOADS_DIR, album_name)
         await safe_edit(status_msg, f"📥 Found {len(items)} items. Starting...")
-
         skipped_files = []
-
         for idx, item in enumerate(items, 1):
             if isinstance(item, dict):
                 file_url = item.get("url")
@@ -166,17 +165,13 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             else:
                 file_url = item
                 file_name = album_name
-
             file_url = fix_bunkr_url(file_url)
-
             await safe_edit(
                 status_msg,
                 f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:30]}"
             )
-
             success = False
             max_retries = 4
-
             for attempt in range(max_retries):
                 try:
                     headers = {
@@ -195,7 +190,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         await asyncio.sleep(2 ** attempt)
                     else:
                         break
-
             if not success:
                 skipped_files.append(file_name)
                 await safe_edit(
@@ -204,13 +198,11 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 )
                 logger.error(f"Skipped file: {file_name} - could not download from {file_url}")
                 continue
-
             file_size = int(response.headers.get("content-length", 0))
             final_path = os.path.join(download_path, file_name)
             downloaded = 0
             start_time = time.time()
             last_update = start_time
-
             try:
                 with open(final_path, "wb") as f:
                     for chunk in response.iter_content(chunk_size=8192):
@@ -245,24 +237,32 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 if os.path.exists(final_path):
                     os.remove(final_path)
                 continue
-
             await safe_edit(
                 status_msg,
                 f"📤 Uploading [{idx}/{len(items)}]: {file_name[:30]}"
             )
-
+            # Generate thumbnail for videos if moviepy is available
             thumb_path = None
-            if MOVIEPY_AVAILABLE and file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
+            if file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
                 try:
                     thumb_path = os.path.join(download_path, f"{file_name}_thumb.jpg")
-                    clip = VideoFileClip(final_path)
-                    clip.save_frame(thumb_path, t=1)
+                    if MOVIEPY_AVAILABLE:
+                        clip = VideoFileClip(final_path)
+                        clip.save_frame(thumb_path, t=1) # Extract frame at 1 second
+                    elif OPENCV_AVAILABLE:
+                        cap = cv2.VideoCapture(final_path)
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 30)  # Assuming 30 fps, frame at ~1 sec
+                        ret, frame = cap.read()
+                        if ret:
+                            cv2.imwrite(thumb_path, frame)
+                        cap.release()
+                    else:
+                        logger.warning("No thumbnail generator available (moviepy or opencv not installed)")
                 except Exception as e:
                     logger.warning(f"Thumbnail generation failed: {e}")
                     thumb_path = None
-
             upload_start_time = time.time()
-            last_update_time = [upload_start_time]
+            last_update_time = [upload_start_time] # Mutable list for throttling
             try:
                 with open(final_path, "rb") as f:
                     if file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
@@ -293,22 +293,20 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             except Exception as upload_err:
                 logger.exception(f"Upload failed for {file_name}: {upload_err}")
                 await safe_edit(status_msg, f"⚠️ Upload failed for {file_name[:30]} (but file was downloaded)")
-
-            if os.path.exists(final_path):
-                os.remove(final_path)
+            # Cleanup
+            os.remove(final_path)
             if thumb_path and os.path.exists(thumb_path):
                 os.remove(thumb_path)
-
+        # Final summary
         summary = f"✅ Done! {album_name}\n"
         if skipped_files:
             summary += f"⚠️ Skipped {len(skipped_files)} file(s): {', '.join(skipped_files[:3])}"
             if len(skipped_files) > 3:
                 summary += f" + {len(skipped_files)-3} more"
         await safe_edit(status_msg, summary)
-
     except Exception as e:
         logger.exception(e)
-        await message.reply_text(f"❌ Critical error (album aborted): {str(e)[:100]}")
+        await message.reply_text(f"❌ Error: {str(e)[:100]}")
 
 @app.on_message(filters.text)
 async def handle_message(client: Client, message: Message):
@@ -316,6 +314,7 @@ async def handle_message(client: Client, message: Message):
     if not urls:
         return
     session = create_session()
+    # Add retries to session to fix connection reset errors
     retry_strategy = Retry(
         total=7,
         backoff_factor=1.5,
@@ -346,11 +345,7 @@ async def help_command(client: Client, message: Message):
 
 def start_bot():
     logger.info("Bot starting...")
-    try:
-        app.run()
-    except Exception as e:
-        logger.error(f"Bot crashed during run: {e}", exc_info=True)
-        raise
+    app.run()
 
 if __name__ == "__main__":
     start_bot()
