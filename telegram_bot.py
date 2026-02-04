@@ -74,26 +74,75 @@ app = Client(
 # ==================
 # URL PATTERNS
 # ==================
-URL_PATTERN = r'(https?://(?:bunkr\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la)|bunkrrr\.org|cyberdrop\.me)[^\s]+)'
+# More flexible URL pattern that captures various formats
+URL_PATTERNS = [
+    r'https?://bunkr\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la)(?:/[^\s]*)?',
+    r'https?://bunkrrr\.org(?:/[^\s]*)?',
+    r'https?://cyberdrop\.me(?:/[^\s]*)?',
+    r'bunkr\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la)(?:/[^\s]*)?',  # without https
+    r'(?:bunkrrr\.org)(?:/[^\s]*)?',
+    r'(?:cyberdrop\.me)(?:/[^\s]*)?'
+]
 
 
 def extract_urls(text):
-    """Extract URLs from text"""
+    """Extract URLs from text with multiple patterns"""
     if not text:
+        logger.debug("[URL EXTRACTION] No text provided")
         return []
-    matches = re.findall(URL_PATTERN, text)
-    logger.info(f"[URL EXTRACTION] Found {len(matches)} URLs in message")
-    for url in matches:
-        logger.info(f"[URL EXTRACTION] URL: {url}")
-    return matches
+    
+    urls = []
+    seen = set()
+    
+    for pattern in URL_PATTERNS:
+        try:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                if match and match not in seen:
+                    # Ensure URL has protocol
+                    url = match if match.startswith('http') else f'https://{match}'
+                    urls.append(url)
+                    seen.add(match)
+                    logger.debug(f"[URL EXTRACTION] Found: {url}")
+        except Exception as e:
+            logger.warning(f"[URL EXTRACTION] Pattern error: {e}")
+    
+    logger.info(f"[URL EXTRACTION] Total URLs found: {len(urls)}")
+    return urls
 
 
 def is_valid_bunkr_url(url):
     """Validate if URL is from supported domains"""
-    is_valid = bool(
-        re.match(r'https?://(?:bunkr\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la)|bunkrrr\.org|cyberdrop\.me)', url)
-    )
-    logger.info(f"[URL VALIDATION] {url} -> Valid: {is_valid}")
+    if not url:
+        return False
+    
+    url_lower = url.lower()
+    
+    is_valid = any([
+        'bunkr.sk' in url_lower,
+        'bunkr.cr' in url_lower,
+        'bunkr.ru' in url_lower,
+        'bunkr.su' in url_lower,
+        'bunkr.pk' in url_lower,
+        'bunkr.is' in url_lower,
+        'bunkr.si' in url_lower,
+        'bunkr.ph' in url_lower,
+        'bunkr.ps' in url_lower,
+        'bunkr.ci' in url_lower,
+        'bunkr.ax' in url_lower,
+        'bunkr.fi' in url_lower,
+        'bunkr.ac' in url_lower,
+        'bunkr.black' in url_lower,
+        'bunkr.la' in url_lower,
+        'bunkrrr.org' in url_lower,
+        'cyberdrop.me' in url_lower,
+    ])
+    
+    if is_valid:
+        logger.info(f"[URL VALIDATION] ✓ Valid: {url}")
+    else:
+        logger.warning(f"[URL VALIDATION] ✗ Invalid: {url}")
+    
     return is_valid
 
 
@@ -284,31 +333,48 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         await message.reply_text(f"❌ Error: {str(e)[:100]}")
 
 
-@app.on_message(filters.text)
+@app.on_message(filters.text & ~filters.bot)
 async def handle_message(client: Client, message: Message):
     """Handle incoming text messages"""
     try:
-        logger.info(f"[MESSAGE RECEIVED] From: {message.from_user.id if message.from_user else 'Unknown'}")
-        logger.info(f"[MESSAGE CONTENT] {message.text[:100] if message.text else 'No text'}")
+        # Get message text safely
+        msg_text = message.text if message.text else ""
         
-        urls = extract_urls(message.text)
+        logger.info(f"[MESSAGE RECEIVED] Chat ID: {message.chat.id}, Type: {message.chat.type}")
+        logger.info(f"[MESSAGE CONTENT] {msg_text[:150] if msg_text else 'No text'}")
         
-        if not urls:
-            logger.info("[NO URLS] No URLs found in message")
+        if not msg_text or len(msg_text) == 0:
+            logger.debug("[NO TEXT] Message has no text content")
+            return
+        
+        urls = extract_urls(msg_text)
+        logger.info(f"[URL DETECTION] Extracted {len(urls)} URLs from message")
+        
+        if not urls or len(urls) == 0:
+            logger.debug("[NO URLS] No URLs found in message")
             return
 
-        logger.info(f"[PROCESSING] {len(urls)} URLs detected")
+        logger.info(f"[PROCESSING] Starting download for {len(urls)} URLs")
         session = create_session()
         
-        for url in urls:
+        for idx, url in enumerate(urls, 1):
+            logger.info(f"[URL CHECK {idx}/{len(urls)}] Checking: {url}")
             if is_valid_bunkr_url(url):
-                logger.info(f"[VALID URL] Starting download for: {url}")
-                await download_and_send_file(client, message, url, session)
+                logger.info(f"[VALID URL {idx}/{len(urls)}] Starting download: {url}")
+                try:
+                    await download_and_send_file(client, message, url, session)
+                except Exception as item_error:
+                    logger.error(f"[ITEM ERROR] Failed to process URL {idx}: {item_error}")
+                    await message.reply_text(f"❌ Error processing URL: {str(item_error)[:100]}")
             else:
-                logger.warning(f"[INVALID URL] Skipping: {url}")
+                logger.warning(f"[INVALID URL {idx}] Domain not supported: {url}")
                 
     except Exception as e:
         logger.exception(f"[MESSAGE HANDLER ERROR] {e}")
+        try:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
+        except:
+            pass
 
 
 @app.on_message(filters.command("start"))
