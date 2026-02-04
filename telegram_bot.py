@@ -172,9 +172,11 @@ async def upload_progress(current, total, status_msg, file_name, idx, total_item
 
 async def download_and_send_file(client: Client, message: Message, url: str, session: requests.Session):
     """Download files from URL and send to Telegram"""
+    status_msg = None
     try:
         logger.info(f"[DOWNLOAD START] Processing URL: {url}")
         status_msg = await message.reply_text(f"🔄 Processing: {url[:50]}...")
+        logger.info("[DOWNLOAD START] Status message sent successfully")
         last_status = ""
 
         is_bunkr = "bunkr" in url or "bunkrrr" in url
@@ -409,20 +411,78 @@ async def help_command(client: Client, message: Message):
     )
 
 
+@app.on_message()
+async def debug_all_messages(client: Client, message: Message):
+    """Debug handler - logs ALL messages"""
+    try:
+        if message.text:
+            logger.debug(f"[DEBUG ALL] Message: {message.text[:100]}")
+    except:
+        pass
+    # IMPORTANT: Don't return, let other handlers process
+
+
+@app.on_message(filters.text & ~filters.bot & ~filters.command(["start", "help"]))
+async def handle_any_message(client: Client, message: Message):
+    """Catch-all handler for text messages that might contain URLs"""
+    try:
+        msg_text = message.text if message.text else ""
+        logger.info(f"[CATCH-ALL] Received message from chat {message.chat.id}: {msg_text[:100]}")
+        
+        # Check if it looks like a URL
+        if "://" in msg_text or "bunkr" in msg_text.lower() or "cyberdrop" in msg_text.lower():
+            logger.info("[CATCH-ALL] Message looks like it contains a link, processing...")
+            urls = extract_urls(msg_text)
+            
+            if urls:
+                logger.info(f"[CATCH-ALL] Found {len(urls)} URLs: {urls}")
+                session = create_session()
+                
+                for idx, url in enumerate(urls, 1):
+                    if is_valid_bunkr_url(url):
+                        logger.info(f"[CATCH-ALL] Processing URL: {url}")
+                        await download_and_send_file(client, message, url, session)
+                    else:
+                        logger.warning(f"[CATCH-ALL] Invalid domain: {url}")
+            else:
+                logger.warning("[CATCH-ALL] No URLs extracted from message")
+        else:
+            logger.debug(f"[CATCH-ALL] Message does not contain URLs")
+            
+    except Exception as e:
+        logger.exception(f"[CATCH-ALL ERROR] {e}")
+        try:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
+        except:
+            logger.error("[CATCH-ALL] Failed to send error message")
+
+
 def start_bot():
-    """Start the bot"""
-    logger.info("=" * 50)
+    """Start the bot with proper error handling"""
+    logger.info("=" * 70)
     logger.info("BUNKR DOWNLOADER BOT STARTING")
-    logger.info("=" * 50)
+    logger.info("=" * 70)
     logger.info(f"API_ID: {API_ID}")
+    logger.info(f"API_HASH: {'SET' if API_HASH else 'NOT SET'}")
+    logger.info(f"BOT_TOKEN: {'SET' if BOT_TOKEN else 'NOT SET'}")
     logger.info(f"Downloads Directory: {DOWNLOADS_DIR}")
     logger.info(f"Python Version: {sys.version}")
-    logger.info("=" * 50)
+    logger.info("=" * 70)
     
     try:
-        app.run()
+        logger.info("[BOT] Connecting to Telegram...")
+        with app:
+            logger.info("[BOT] ✓ Connected successfully!")
+            logger.info("[BOT] Starting to listen for messages...")
+            app.run()
+            
+    except KeyboardInterrupt:
+        logger.info("[BOT] Shutdown requested by user")
+        sys.exit(0)
     except Exception as e:
         logger.exception(f"[BOT ERROR] Bot crashed: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
