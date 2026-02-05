@@ -23,12 +23,7 @@ import subprocess
 import json
 from concurrent.futures import ThreadPoolExecutor
 import threading
-
-try:
-    from moviepy.editor import VideoFileClip
-    MOVIEPY_AVAILABLE = True
-except ImportError:
-    MOVIEPY_AVAILABLE = False
+import struct
 
 try:
     import cv2
@@ -37,7 +32,7 @@ except ImportError:
     OPENCV_AVAILABLE = False
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -152,44 +147,76 @@ def fix_bunkr_url(url: str) -> str:
     url = url.replace("c.bunkr.is", "c.bunkr.su")
     return url
 
-def get_video_duration_ffprobe(video_path: str) -> int:
-    """Get video duration using ffprobe"""
+# ⚡ MEMORY-EFFICIENT VIDEO DURATION EXTRACTION (No MoviePy!)
+def get_video_duration_from_file(video_path: str) -> int:
+    """
+    Extract video duration without loading entire file into memory.
+    Uses binary parsing for MP4.
+    """
     try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1:noprint_indexes=1", video_path],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            duration = int(float(result.stdout.strip()) + 0.5)
-            logger.info(f"[v0] ffprobe duration: {duration}s")
-            return duration
+        with open(video_path, 'rb') as f:
+            # Skip to find 'moov' atom
+            while True:
+                size_bytes = f.read(4)
+                if not size_bytes or len(size_bytes) < 4:
+                    break
+                
+                atom_type = f.read(4)
+                if atom_type == b'moov':
+                    moov_size = struct.unpack('>I', size_bytes)[0]
+                    moov_end = f.tell() + moov_size - 8
+                    
+                    while f.tell() < moov_end:
+                        sub_size_bytes = f.read(4)
+                        if not sub_size_bytes or len(sub_size_bytes) < 4:
+                            break
+                        
+                        sub_atom = f.read(4)
+                        if sub_atom == b'mvhd':
+                            version = f.read(1)
+                            flags = f.read(3)
+                            creation_time = f.read(4)
+                            modification_time = f.read(4)
+                            timescale_bytes = f.read(4)
+                            duration_bytes = f.read(4)
+                            
+                            timescale = struct.unpack('>I', timescale_bytes)[0]
+                            duration_units = struct.unpack('>I', duration_bytes)[0]
+                            
+                            if timescale > 0:
+                                duration = int(duration_units / timescale)
+                                if duration > 0:
+                                    logger.info(f"[v0] MP4 parsing duration: {duration}s")
+                                    return duration
+                        else:
+                            sub_size = struct.unpack('>I', sub_size_bytes)[0]
+                            if sub_size > 8:
+                                f.seek(f.tell() + sub_size - 8)
+                else:
+                    size = struct.unpack('>I', size_bytes)[0]
+                    if size > 8:
+                        f.seek(f.tell() + size - 8)
     except Exception as e:
-        logger.warning(f"[v0] ffprobe duration failed: {e}")
+        logger.warning(f"[v0] MP4 parsing failed: {e}")
+    
     return None
 
 def get_video_duration(video_path: str) -> int:
-    """Returns video duration in seconds"""
+    """
+    Returns video duration in seconds.
+    Tries: MP4 parsing → OpenCV → None
+    (Removed MoviePy due to memory issues)
+    """
     if not os.path.exists(video_path):
         logger.warning(f"[v0] Video file not found: {video_path}")
         return None
     
-    duration = get_video_duration_ffprobe(video_path)
+    # Try MP4 binary parsing first (memory efficient)
+    duration = get_video_duration_from_file(video_path)
     if duration is not None and duration > 0:
         return duration
     
-    if MOVIEPY_AVAILABLE:
-        try:
-            clip = VideoFileClip(video_path)
-            duration = int(clip.duration)
-            clip.close()
-            if duration > 0:
-                logger.info(f"[v0] MoviePy duration: {duration}s")
-                return duration
-        except Exception as e:
-            logger.warning(f"[v0] MoviePy duration failed: {e}")
-    
+    # Try OpenCV (memory efficient)
     if OPENCV_AVAILABLE:
         try:
             cap = cv2.VideoCapture(video_path)
@@ -205,84 +232,65 @@ def get_video_duration(video_path: str) -> int:
         except Exception as e:
             logger.warning(f"[v0] OpenCV duration failed: {e}")
     
+    logger.warning(f"[v0] Could not determine video duration for {video_path}")
     return None
 
-def get_video_resolution_ffprobe(video_path: str) -> tuple:
-    """Get video resolution using ffprobe"""
+def get_video_resolution_opencv(video_path: str) -> tuple:
+    """Get video resolution using OpenCV (memory efficient)"""
+    if not OPENCV_AVAILABLE:
+        return (None, None)
+    
     try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", video_path],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            parts = result.stdout.strip().split('x')
-            if len(parts) == 2:
-                width, height = int(parts[0]), int(parts[1])
-                logger.info(f"[v0] ffprobe resolution: {width}x{height}")
+        cap = cv2.VideoCapture(video_path)
+        if cap.isOpened():
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            if width > 0 and height > 0:
+                logger.info(f"[v0] OpenCV resolution: {width}x{height}")
                 return (width, height)
     except Exception as e:
-        logger.warning(f"[v0] ffprobe resolution failed: {e}")
+        logger.warning(f"[v0] OpenCV resolution failed: {e}")
+    
     return (None, None)
 
-async def generate_video_thumbnail_ffmpeg(video_path: str, output_path: str) -> bool:
-    """Generate thumbnail using ffmpeg"""
-    try:
-        subprocess.run(
-            ["ffmpeg", "-i", video_path, "-ss", "00:00:01.000", "-vframes", "1", "-y", output_path],
-            capture_output=True,
-            timeout=15
-        )
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
-            logger.info(f"[v0] ffmpeg thumbnail generated successfully")
-            return True
-    except Exception as e:
-        logger.warning(f"[v0] ffmpeg thumbnail failed: {e}")
-    return False
-
-async def generate_video_thumbnail_moviepy(video_path: str, output_path: str) -> bool:
-    """Generate thumbnail using moviepy"""
-    try:
-        clip = VideoFileClip(video_path)
-        frame = clip.get_frame(1)
-        clip.close()
-        img = Image.fromarray(frame)
-        img.save(output_path, "JPEG")
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
-            logger.info(f"[v0] MoviePy thumbnail generated successfully")
-            return True
-    except Exception as e:
-        logger.warning(f"[v0] MoviePy thumbnail failed: {e}")
-    return False
-
 async def generate_video_thumbnail_opencv(video_path: str, output_path: str) -> bool:
-    """Generate thumbnail using opencv"""
+    """Generate thumbnail using OpenCV (memory efficient, frame at 1 second)"""
+    if not OPENCV_AVAILABLE:
+        return False
+    
     try:
         cap = cv2.VideoCapture(video_path)
         if cap.isOpened():
             fps = cap.get(cv2.CAP_PROP_FPS)
             frame_num = int(fps * 1) if fps > 0 else 30
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            
             ret, frame = cap.read()
             cap.release()
+            
             if ret and frame is not None:
+                frame = cv2.resize(frame, (320, 180))
                 cv2.imwrite(output_path, frame)
-                if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+                
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 500:
                     logger.info(f"[v0] OpenCV thumbnail generated successfully")
                     return True
     except Exception as e:
         logger.warning(f"[v0] OpenCV thumbnail failed: {e}")
+    
     return False
 
 async def generate_fallback_thumbnail(video_path: str, output_path: str) -> bool:
-    """Generate a simple fallback thumbnail"""
+    """Generate a simple fallback thumbnail using PIL"""
     try:
         if not PIL_AVAILABLE:
             return False
+        
         width, height = 320, 180
         img = Image.new('RGB', (width, height), color='#1a1a1a')
         draw = ImageDraw.Draw(img)
+        
         center_x, center_y = width // 2, height // 2
         triangle_size = 30
         points = [
@@ -291,25 +299,26 @@ async def generate_fallback_thumbnail(video_path: str, output_path: str) -> bool
             (center_x + triangle_size, center_y)
         ]
         draw.polygon(points, fill='#ffffff')
-        img.save(output_path, "JPEG")
+        
+        img.save(output_path, "JPEG", quality=70)
         logger.info(f"[v0] Fallback thumbnail generated")
         return True
     except Exception as e:
         logger.warning(f"[v0] Fallback thumbnail failed: {e}")
+    
     return False
 
 async def generate_video_thumbnail(video_path: str, output_path: str) -> bool:
-    """Generate thumbnail using ffmpeg, moviepy, opencv, or fallback"""
+    """Generate thumbnail using OpenCV or fallback"""
     if not os.path.exists(video_path):
         logger.warning(f"[v0] Video file not found for thumbnail: {video_path}")
         return False
     
-    if await generate_video_thumbnail_ffmpeg(video_path, output_path):
+    # Try OpenCV first
+    if await generate_video_thumbnail_opencv(video_path, output_path):
         return True
-    if MOVIEPY_AVAILABLE and await generate_video_thumbnail_moviepy(video_path, output_path):
-        return True
-    if OPENCV_AVAILABLE and await generate_video_thumbnail_opencv(video_path, output_path):
-        return True
+    
+    # Fallback to PIL
     if await generate_fallback_thumbnail(video_path, output_path):
         return True
     
@@ -477,7 +486,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                     os.remove(final_path)
                 continue
             
-            # Video metadata extraction
+            # Video metadata extraction (memory-efficient)
             duration = None
             width = None
             height = None
@@ -486,25 +495,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             if is_video:
                 logger.info(f"[v0] Getting video metadata for {file_name}")
                 duration = get_video_duration(final_path)
-                width, height = get_video_resolution_ffprobe(final_path)
-                
-                if width is None and MOVIEPY_AVAILABLE:
-                    try:
-                        clip = VideoFileClip(final_path)
-                        width, height = clip.size
-                        clip.close()
-                    except Exception as e:
-                        logger.warning(f"[v0] MoviePy resolution failed: {e}")
-                
-                if width is None and OPENCV_AVAILABLE:
-                    try:
-                        cap = cv2.VideoCapture(final_path)
-                        if cap.isOpened():
-                            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                            cap.release()
-                    except Exception as e:
-                        logger.warning(f"[v0] OpenCV resolution failed: {e}")
+                width, height = get_video_resolution_opencv(final_path)
             
             # Thumbnail generation
             thumb_path = None
@@ -578,11 +569,16 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 logger.exception(f"Upload failed for {file_name}: {upload_err}")
                 await safe_edit(status_msg, f"⚠️ Upload failed for {file_name[:30]}")
             
-            # Cleanup
-            if os.path.exists(final_path):
-                os.remove(final_path)
-            if thumb_path and os.path.exists(thumb_path):
-                os.remove(thumb_path)
+            # Aggressive cleanup to free memory
+            try:
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+                    logger.info(f"[v0] Cleaned up: {file_name}")
+                if thumb_path and os.path.exists(thumb_path):
+                    os.remove(thumb_path)
+                    logger.info(f"[v0] Cleaned up thumbnail: {thumb_filename}")
+            except Exception as e:
+                logger.warning(f"[v0] Cleanup failed: {e}")
         
         # Final summary
         summary = f"✅ Done! {album_name}\n"
@@ -630,5 +626,17 @@ async def help_command(client: Client, message: Message):
         "• Fast upload speeds (7-10 MB/s)\n"
         "• Connection pooling for better throughput\n"
         "• Real-time speed monitoring\n"
-        "• Optimized chunk sizes"
+        "• Memory-efficient processing"
+    )
+
+@app.on_message(filters.command("about"))
+async def about_command(client: Client, message: Message):
+    await message.reply_text(
+        "🤖 **Bunkr Downloader Bot v2.0**\n\n"
+        "Optimized for Heroku with:\n"
+        "✅ Memory-efficient video processing\n"
+        "✅ Auto-cleanup after each upload\n"
+        "✅ Graceful error handling\n"
+        "✅ Fast parallel downloads\n\n"
+        "Support: @BunkrDownloaderBot"
     )
