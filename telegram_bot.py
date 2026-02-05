@@ -127,27 +127,27 @@ def get_video_duration_ffprobe(video_path: str) -> int:
             return duration
     except Exception as e:
         logger.warning(f"[v0] ffprobe duration failed: {e}")
-    return 0
+    return None
 
 def get_video_duration(video_path: str) -> int:
     """
-    Returns video duration in seconds (int) or 0 if failed
+    Returns video duration in seconds (int) or None if failed
     Uses ffprobe (most reliable on Heroku)
     """
     if not os.path.exists(video_path):
         logger.warning(f"[v0] Video file not found: {video_path}")
-        return 0
+        return None
 
     # Use ffprobe - most reliable for Heroku
     duration = get_video_duration_ffprobe(video_path)
-    if duration > 0:
+    if duration is not None and duration > 0:
         return duration
 
     logger.warning(f"[v0] Could not determine video duration for {video_path}")
-    return 0
+    return None
 
 def get_video_resolution_ffprobe(video_path: str) -> tuple:
-    """Get video resolution using ffprobe"""
+    """Get video resolution using ffprobe, returns (width, height) or (None, None) if failed"""
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", video_path],
@@ -163,7 +163,7 @@ def get_video_resolution_ffprobe(video_path: str) -> tuple:
                 return (width, height)
     except Exception as e:
         logger.warning(f"[v0] ffprobe resolution failed: {e}")
-    return (0, 0)
+    return (None, None)
 
 async def generate_video_thumbnail_ffmpeg(video_path: str, output_path: str) -> bool:
     """Generate thumbnail using ffmpeg"""
@@ -340,20 +340,20 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 continue
 
             # Get duration and resolution
-            duration = 0
-            width = 0
-            height = 0
+            duration = None
+            width = None
+            height = None
 
             is_video = file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm'))
 
             if is_video:
                 logger.info(f"[v0] Getting video metadata for {file_name}")
                 duration = get_video_duration(final_path)
-                logger.info(f"[v0] Duration result: {duration}s")
+                logger.info(f"[v0] Duration result: {duration if duration else 'None (ffmpeg not available)'}s")
 
                 # Get resolution
                 width, height = get_video_resolution_ffprobe(final_path)
-                if width == 0 and MOVIEPY_AVAILABLE:
+                if width is None and MOVIEPY_AVAILABLE:
                     try:
                         clip = VideoFileClip(final_path)
                         width, height = clip.size
@@ -361,7 +361,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         logger.info(f"[v0] MoviePy resolution: {width}x{height}")
                     except Exception as e:
                         logger.warning(f"[v0] MoviePy resolution failed: {e}")
-                if width == 0 and OPENCV_AVAILABLE:
+                if width is None and OPENCV_AVAILABLE:
                     try:
                         cap = cv2.VideoCapture(final_path)
                         if cap.isOpened():
@@ -396,18 +396,27 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             try:
                 with open(final_path, "rb") as f:
                     if is_video:
-                        await client.send_video(
-                            message.chat.id,
-                            f,
-                            caption=f" {file_name}",
-                            thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
-                            duration=duration if duration > 0 else None,
-                            width=width if width > 0 else None,
-                            height=height if height > 0 else None,
-                            supports_streaming=True,
-                            progress=upload_progress,
-                            progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
-                        )
+                        # Only pass parameters if they have valid values
+                        send_kwargs = {
+                            "chat_id": message.chat.id,
+                            "video": f,
+                            "caption": f" {file_name}",
+                            "supports_streaming": True,
+                            "progress": upload_progress,
+                            "progress_args": (status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
+                        }
+                        
+                        # Add optional parameters only if they're not None
+                        if thumb_path and os.path.exists(thumb_path):
+                            send_kwargs["thumb"] = thumb_path
+                        if duration is not None and duration > 0:
+                            send_kwargs["duration"] = duration
+                        if width is not None and width > 0:
+                            send_kwargs["width"] = width
+                        if height is not None and height > 0:
+                            send_kwargs["height"] = height
+                        
+                        await client.send_video(**send_kwargs)
                     elif file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
                         await client.send_photo(
                             message.chat.id,
