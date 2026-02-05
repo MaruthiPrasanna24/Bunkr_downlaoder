@@ -13,7 +13,6 @@ def check_env():
 
     if not all([api_id, api_hash, bot_token]):
         print("❌ Missing required environment variables!")
-        print("Required: TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_BOT_TOKEN")
         sys.exit(1)
 
     return int(api_id), api_hash, bot_token
@@ -22,9 +21,8 @@ def check_env():
 async def main():
     print("🚀 Starting Telegram Bot...")
 
-    API_ID, API_HASH, BOT_TOKEN = check_env()
+    check_env()
 
-    # IMPORTANT: import AFTER env check
     from telegram_bot import app
 
     await app.start()
