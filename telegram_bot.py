@@ -6,10 +6,17 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from dotenv import load_dotenv
 import logging
+from dump import (
+    get_items_list,
+    create_session,
+    get_and_prepare_download_path,
+    get_real_download_url,
+    get_url_data
+)
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from urllib.parse import urljoin, unquote, urlparse
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from pyrogram.errors import MessageNotModified
 
@@ -103,39 +110,6 @@ def fix_bunkr_url(url: str) -> str:
     url = url.replace("c.bunkr.is", "c.bunkr.su")
     return url
 
-def get_video_duration(video_path: str) -> int:
-    """
-    Returns video duration in seconds (int) or 0 if failed
-    """
-    duration = 0
-    if MOVIEPY_AVAILABLE:
-        try:
-            clip = VideoFileClip(video_path)
-            duration = int(clip.duration + 0.5)  # round to nearest second
-            clip.close()
-            if duration > 0:
-                return duration
-        except Exception as e:
-            logger.warning(f"MoviePy duration read failed: {e}")
-
-    if OPENCV_AVAILABLE:
-        try:
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                return 0
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-            if fps > 0 and frame_count > 0:
-                duration = int(frame_count / fps + 0.5)
-            cap.release()
-            if duration > 0:
-                return duration
-        except Exception as e:
-            logger.warning(f"OpenCV duration read failed: {e}")
-
-    logger.warning("Could not determine video duration")
-    return duration
-
 async def generate_video_thumbnail(video_path: str, output_path: str) -> bool:
     """
     Try to generate thumbnail using moviepy or opencv
@@ -156,81 +130,31 @@ async def generate_video_thumbnail(video_path: str, output_path: str) -> bool:
             if not cap.isOpened():
                 logger.warning("Cannot open video with OpenCV")
                 return False
+
+            # Try to get frame at ~1 second
             fps = cap.get(cv2.CAP_PROP_FPS)
             frame_pos = int(fps * 1) if fps > 0 else 30
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
+
             ret, frame = cap.read()
             if ret:
                 cv2.imwrite(output_path, frame)
                 cap.release()
                 return True
-            # Fallback: first frame
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, frame = cap.read()
-            if ret:
-                cv2.imwrite(output_path, frame)
+            else:
+                # Fallback: try first frame
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+                if ret:
+                    cv2.imwrite(output_path, frame)
+                    cap.release()
+                    return True
                 cap.release()
-                return True
-            cap.release()
         except Exception as e:
             logger.warning(f"OpenCV thumbnail failed: {e}")
 
     logger.warning("No thumbnail generated - neither moviepy nor opencv worked")
     return False
-
-# Define the missing functions from dump.py
-
-def create_session():
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    })
-    return session
-
-def get_and_prepare_download_path(base_dir, album_name):
-    path = os.path.join(base_dir, re.sub(r'[^\w\-_\. ]', '_', album_name))  # Sanitize album name
-    os.makedirs(path, exist_ok=True)
-    return path
-
-def get_real_download_url(session, url, is_direct, name):
-    try:
-        logger.info(f"Fetching real download URL for: {url}")
-        r = session.get(url, timeout=30)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.content, 'html.parser')
-
-        domain = urlparse(url).netloc.lower()
-        if 'cyberdrop' in domain:
-            # Cyberdrop file page parsing
-            file_div = soup.find('div', id='file')
-            if file_div:
-                dl_a = file_div.find('a')
-                if dl_a:
-                    direct_url = dl_a['href']
-                    filename = unquote(direct_url.split('/')[-1])
-                    return {'url': direct_url, 'name': filename or name}
-            logger.warning("No download link found in Cyberdrop page")
-            return None
-        else:
-            # Bunkr file page parsing
-            media = soup.find('source') or soup.find('img')
-            if media:
-                direct_url = media['src']
-                if not direct_url.startswith(('http://', 'https://')):
-                    direct_url = urljoin('https://media-files.bunkr.su/', direct_url)
-                filename = media.get('data-download-filename') or unquote(direct_url.split('/')[-1]) or name
-                return {'url': direct_url, 'name': filename}
-            # Fallback to download button
-            dl_button = soup.find('a', string=re.compile('download', re.I)) or soup.find('button', string=re.compile('download', re.I))
-            if dl_button and 'href' in dl_button.attrs:
-                direct_url = urljoin(url, dl_button['href'])
-                filename = unquote(direct_url.split('/')[-1]) or name
-                return {'url': direct_url, 'name': filename}
-            logger.warning("No media or download link found in Bunkr page")
-            return None
-    except Exception as e:
-        logger.error(f"Error getting real download URL for {url}: {e}")
-        return None
 
 async def download_and_send_file(client: Client, message: Message, url: str, session: requests.Session):
     try:
@@ -239,6 +163,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         last_status = ""
         is_bunkr = "bunkr" in url or "bunkrrr" in url
         logger.info(f"[v0] is_bunkr: {is_bunkr}")
+
         url = url.replace("bunkr.pk", "bunkr.su").replace("bunkr.is", "bunkr.su")
         if is_bunkr and not url.startswith("https"):
             url = f"https://bunkr.su{url}"
@@ -254,7 +179,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             soup.find('div', {'class': 'lightgallery'}) is not None
         )
         items = []
-
         if is_direct:
             h1 = soup.find('h1', {'class': 'text-[20px]'}) or soup.find('h1', {'class': 'truncate'})
             album_name = h1.text if h1 else "file"
@@ -281,7 +205,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         await safe_edit(status_msg, f"📥 Found {len(items)} items. Starting...")
 
         skipped_files = []
-        seen_urls = set()  # To prevent duplicate downloads
 
         for idx, item in enumerate(items, 1):
             if isinstance(item, dict):
@@ -290,11 +213,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             else:
                 file_url = item
                 file_name = album_name
-
-            if file_url in seen_urls:
-                logger.info(f"Skipping duplicate file_url: {file_url}")
-                continue
-            seen_urls.add(file_url)
 
             file_url = fix_bunkr_url(file_url)
 
@@ -305,6 +223,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
 
             success = False
             max_retries = 4
+
             for attempt in range(max_retries):
                 try:
                     headers = {
@@ -315,9 +234,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                     if response.status_code == 200:
                         success = True
                         break
-                    elif response.status_code == 404:
-                        logger.warning(f"HTTP 404 for {file_url} on attempt {attempt+1}")
-                        break  # No retry for 404
                     else:
                         logger.warning(f"HTTP {response.status_code} on attempt {attempt+1}")
                 except Exception as e:
@@ -375,42 +291,14 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                     os.remove(final_path)
                 continue
 
-            # Get duration, width, height
-            duration = 0
-            width = 0
-            height = 0
-
-            is_video = file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm'))
-
-            if is_video:
-                duration = get_video_duration(final_path)
-
-                # Get resolution
-                if duration > 0:  # Only if duration succeeded, try resolution
-                    if MOVIEPY_AVAILABLE:
-                        try:
-                            clip = VideoFileClip(final_path)
-                            width, height = clip.size
-                            clip.close()
-                        except Exception as e:
-                            logger.warning(f"MoviePy resolution failed: {e}")
-                    if width == 0 and OPENCV_AVAILABLE:
-                        try:
-                            cap = cv2.VideoCapture(final_path)
-                            if cap.isOpened():
-                                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                            cap.release()
-                        except Exception as e:
-                            logger.warning(f"OpenCV resolution failed: {e}")
-
             # Thumbnail generation
             thumb_path = None
-            if is_video:
+            if file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
                 thumb_filename = f"{file_name}_thumb.jpg"
                 thumb_path = os.path.join(download_path, thumb_filename)
-                success_thumb = await generate_video_thumbnail(final_path, thumb_path)
-                if not success_thumb or not os.path.exists(thumb_path):
+
+                success = await generate_video_thumbnail(final_path, thumb_path)
+                if not success or not os.path.exists(thumb_path):
                     logger.warning(f"Thumbnail not created for {file_name}")
                     thumb_path = None
 
@@ -424,16 +312,12 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
 
             try:
                 with open(final_path, "rb") as f:
-                    if is_video:
+                    if file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
                         await client.send_video(
                             message.chat.id,
                             f,
                             caption=f"✅ {file_name}",
                             thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
-                            duration=duration,
-                            width=width if width > 0 else 0,
-                            height=height if height > 0 else 0,
-                            supports_streaming=True,
                             progress=upload_progress,
                             progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         )
@@ -478,10 +362,8 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
 @app.on_message(filters.text)
 async def handle_message(client: Client, message: Message):
     urls = extract_urls(message.text)
-    unique_urls = list(set(urls))  # Deduplicate URLs to prevent multiple processing
-    if not unique_urls:
+    if not urls:
         return
-
     session = create_session()
     retry_strategy = Retry(
         total=7,
@@ -492,8 +374,7 @@ async def handle_message(client: Client, message: Message):
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-
-    for url in unique_urls:
+    for url in urls:
         if is_valid_bunkr_url(url):
             await download_and_send_file(client, message, url, session)
 
