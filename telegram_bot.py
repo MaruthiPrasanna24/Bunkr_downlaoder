@@ -52,15 +52,13 @@ DOWNLOADS_DIR = os.getenv('DOWNLOADS_DIR', 'downloads')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ⚡ OPTIMIZED PYROGRAM CLIENT WITH FASTER UPLOAD SETTINGS
+# ⚡ OPTIMIZED PYROGRAM CLIENT
 app = Client(
     "bunkr_downloader_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     workdir=".",
-    # Optimized connection pooling for faster uploads
-    connection_pooling=True,
 )
 
 # Enhanced session with connection pooling
@@ -634,4 +632,3 @@ async def help_command(client: Client, message: Message):
         "• Real-time speed monitoring\n"
         "• Optimized chunk sizes"
     )
-
