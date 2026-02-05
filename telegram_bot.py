@@ -19,6 +19,8 @@ from urllib3.util.retry import Retry
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from pyrogram.errors import MessageNotModified
+import subprocess
+import json
 
 try:
     from moviepy.editor import VideoFileClip
@@ -110,79 +112,88 @@ def fix_bunkr_url(url: str) -> str:
     url = url.replace("c.bunkr.is", "c.bunkr.su")
     return url
 
+def get_video_duration_ffprobe(video_path: str) -> int:
+    """Get video duration using ffprobe (most reliable)"""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1:noprint_indexes=1", video_path],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            duration = int(float(result.stdout.strip()) + 0.5)
+            logger.info(f"[v0] ffprobe duration: {duration}s for {video_path}")
+            return duration
+    except Exception as e:
+        logger.warning(f"[v0] ffprobe duration failed: {e}")
+    return 0
+
 def get_video_duration(video_path: str) -> int:
     """
     Returns video duration in seconds (int) or 0 if failed
+    Uses ffprobe (most reliable on Heroku)
     """
-    duration = 0
-    if MOVIEPY_AVAILABLE:
-        try:
-            clip = VideoFileClip(video_path)
-            duration = int(clip.duration + 0.5)  # round to nearest second
-            clip.close()
-            if duration > 0:
-                return duration
-        except Exception as e:
-            logger.warning(f"MoviePy duration read failed: {e}")
+    if not os.path.exists(video_path):
+        logger.warning(f"[v0] Video file not found: {video_path}")
+        return 0
 
-    if OPENCV_AVAILABLE:
-        try:
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                return 0
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-            if fps > 0 and frame_count > 0:
-                duration = int(frame_count / fps + 0.5)
-            cap.release()
-            if duration > 0:
-                return duration
-        except Exception as e:
-            logger.warning(f"OpenCV duration read failed: {e}")
+    # Use ffprobe - most reliable for Heroku
+    duration = get_video_duration_ffprobe(video_path)
+    if duration > 0:
+        return duration
 
-    logger.warning("Could not determine video duration")
-    return duration
+    logger.warning(f"[v0] Could not determine video duration for {video_path}")
+    return 0
+
+def get_video_resolution_ffprobe(video_path: str) -> tuple:
+    """Get video resolution using ffprobe"""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", video_path],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            parts = result.stdout.strip().split('x')
+            if len(parts) == 2:
+                width, height = int(parts[0]), int(parts[1])
+                logger.info(f"[v0] ffprobe resolution: {width}x{height}")
+                return (width, height)
+    except Exception as e:
+        logger.warning(f"[v0] ffprobe resolution failed: {e}")
+    return (0, 0)
+
+async def generate_video_thumbnail_ffmpeg(video_path: str, output_path: str) -> bool:
+    """Generate thumbnail using ffmpeg"""
+    try:
+        subprocess.run(
+            ["ffmpeg", "-i", video_path, "-ss", "00:00:01.000", "-vframes", "1", "-y", output_path],
+            capture_output=True,
+            timeout=15
+        )
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            logger.info(f"[v0] ffmpeg thumbnail generated successfully")
+            return True
+    except Exception as e:
+        logger.warning(f"[v0] ffmpeg thumbnail failed: {e}")
+    return False
 
 async def generate_video_thumbnail(video_path: str, output_path: str) -> bool:
     """
-    Try to generate thumbnail using moviepy or opencv
+    Generate thumbnail using ffmpeg (most reliable on Heroku)
     Returns True if successful, False otherwise
     """
-    if MOVIEPY_AVAILABLE:
-        try:
-            clip = VideoFileClip(video_path)
-            clip.save_frame(output_path, t=1)
-            clip.close()
-            return True
-        except Exception as e:
-            logger.warning(f"MoviePy thumbnail failed: {e}")
+    if not os.path.exists(video_path):
+        logger.warning(f"[v0] Video file not found for thumbnail: {video_path}")
+        return False
 
-    if OPENCV_AVAILABLE:
-        try:
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                logger.warning("Cannot open video with OpenCV")
-                return False
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_pos = int(fps * 1) if fps > 0 else 30
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
-            ret, frame = cap.read()
-            if ret:
-                cv2.imwrite(output_path, frame)
-                cap.release()
-                return True
-            # Fallback: first frame
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, frame = cap.read()
-            if ret:
-                cv2.imwrite(output_path, frame)
-                cap.release()
-                return True
-            cap.release()
-        except Exception as e:
-            logger.warning(f"OpenCV thumbnail failed: {e}")
+    # Use ffmpeg - most reliable for Heroku
+    if await generate_video_thumbnail_ffmpeg(video_path, output_path):
+        return True
 
-    logger.warning("No thumbnail generated - neither moviepy nor opencv worked")
+    logger.warning(f"[v0] No thumbnail generated for {video_path}")
     return False
 
 async def download_and_send_file(client: Client, message: Message, url: str, session: requests.Session):
@@ -234,7 +245,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         await safe_edit(status_msg, f"📥 Found {len(items)} items. Starting...")
 
         skipped_files = []
-        seen_urls = set()  # To prevent duplicate downloads
+        seen_urls = set()
 
         for idx, item in enumerate(items, 1):
             if isinstance(item, dict):
@@ -270,7 +281,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         break
                     elif response.status_code == 404:
                         logger.warning(f"HTTP 404 for {file_url} on attempt {attempt+1}")
-                        break  # No retry for 404
+                        break
                     else:
                         logger.warning(f"HTTP {response.status_code} on attempt {attempt+1}")
                 except Exception as e:
@@ -328,7 +339,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                     os.remove(final_path)
                 continue
 
-            # Get duration, width, height
+            # Get duration and resolution
             duration = 0
             width = 0
             height = 0
@@ -336,35 +347,42 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             is_video = file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm'))
 
             if is_video:
+                logger.info(f"[v0] Getting video metadata for {file_name}")
                 duration = get_video_duration(final_path)
+                logger.info(f"[v0] Duration result: {duration}s")
 
                 # Get resolution
-                if duration > 0:  # Only if duration succeeded, try resolution
-                    if MOVIEPY_AVAILABLE:
-                        try:
-                            clip = VideoFileClip(final_path)
-                            width, height = clip.size
-                            clip.close()
-                        except Exception as e:
-                            logger.warning(f"MoviePy resolution failed: {e}")
-                    if width == 0 and OPENCV_AVAILABLE:
-                        try:
-                            cap = cv2.VideoCapture(final_path)
-                            if cap.isOpened():
-                                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                width, height = get_video_resolution_ffprobe(final_path)
+                if width == 0 and MOVIEPY_AVAILABLE:
+                    try:
+                        clip = VideoFileClip(final_path)
+                        width, height = clip.size
+                        clip.close()
+                        logger.info(f"[v0] MoviePy resolution: {width}x{height}")
+                    except Exception as e:
+                        logger.warning(f"[v0] MoviePy resolution failed: {e}")
+                if width == 0 and OPENCV_AVAILABLE:
+                    try:
+                        cap = cv2.VideoCapture(final_path)
+                        if cap.isOpened():
+                            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                             cap.release()
-                        except Exception as e:
-                            logger.warning(f"OpenCV resolution failed: {e}")
+                            logger.info(f"[v0] OpenCV resolution: {width}x{height}")
+                    except Exception as e:
+                        logger.warning(f"[v0] OpenCV resolution failed: {e}")
 
             # Thumbnail generation
             thumb_path = None
             if is_video:
                 thumb_filename = f"{file_name}_thumb.jpg"
                 thumb_path = os.path.join(download_path, thumb_filename)
+                logger.info(f"[v0] Generating thumbnail for {file_name}")
                 success_thumb = await generate_video_thumbnail(final_path, thumb_path)
-                if not success_thumb or not os.path.exists(thumb_path):
-                    logger.warning(f"Thumbnail not created for {file_name}")
+                if success_thumb and os.path.exists(thumb_path):
+                    logger.info(f"[v0] Thumbnail created successfully: {thumb_path}")
+                else:
+                    logger.warning(f"[v0] Thumbnail not created for {file_name}")
                     thumb_path = None
 
             await safe_edit(
@@ -383,9 +401,9 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             f,
                             caption=f" {file_name}",
                             thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
-                            duration=duration,
-                            width=width if width > 0 else 0,
-                            height=height if height > 0 else 0,
+                            duration=duration if duration > 0 else None,
+                            width=width if width > 0 else None,
+                            height=height if height > 0 else None,
                             supports_streaming=True,
                             progress=upload_progress,
                             progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
@@ -431,7 +449,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
 @app.on_message(filters.text & (filters.private | filters.group))
 async def handle_message(client: Client, message: Message):
     urls = extract_urls(message.text)
-    unique_urls = list(set(urls))  # Deduplicate URLs to prevent multiple processing
+    unique_urls = list(set(urls))
     if not unique_urls:
         return
 
@@ -464,4 +482,3 @@ async def help_command(client: Client, message: Message):
         "Send any Bunkr / Cyberdrop link.\n"
         "Progress updates + auto upload supported."
     )
-
