@@ -34,6 +34,12 @@ try:
 except ImportError:
     OPENCV_AVAILABLE = False
 
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
 load_dotenv()
 
 API_ID = int(os.getenv('TELEGRAM_API_ID'))
@@ -132,16 +138,44 @@ def get_video_duration_ffprobe(video_path: str) -> int:
 def get_video_duration(video_path: str) -> int:
     """
     Returns video duration in seconds (int) or None if failed
-    Uses ffprobe (most reliable on Heroku)
+    Tries ffprobe first, then moviepy, then opencv
     """
     if not os.path.exists(video_path):
         logger.warning(f"[v0] Video file not found: {video_path}")
         return None
 
-    # Use ffprobe - most reliable for Heroku
+    # Try ffprobe first
     duration = get_video_duration_ffprobe(video_path)
     if duration is not None and duration > 0:
         return duration
+
+    # Fallback to moviepy
+    if MOVIEPY_AVAILABLE:
+        try:
+            clip = VideoFileClip(video_path)
+            duration = int(clip.duration)
+            clip.close()
+            if duration > 0:
+                logger.info(f"[v0] MoviePy duration: {duration}s")
+                return duration
+        except Exception as e:
+            logger.warning(f"[v0] MoviePy duration failed: {e}")
+
+    # Fallback to opencv
+    if OPENCV_AVAILABLE:
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if cap.isOpened():
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                cap.release()
+                if fps > 0 and frame_count > 0:
+                    duration = int(frame_count / fps)
+                    if duration > 0:
+                        logger.info(f"[v0] OpenCV duration: {duration}s")
+                        return duration
+        except Exception as e:
+            logger.warning(f"[v0] OpenCV duration failed: {e}")
 
     logger.warning(f"[v0] Could not determine video duration for {video_path}")
     return None
@@ -180,17 +214,96 @@ async def generate_video_thumbnail_ffmpeg(video_path: str, output_path: str) -> 
         logger.warning(f"[v0] ffmpeg thumbnail failed: {e}")
     return False
 
+async def generate_video_thumbnail_moviepy(video_path: str, output_path: str) -> bool:
+    """Generate thumbnail using moviepy"""
+    try:
+        clip = VideoFileClip(video_path)
+        frame = clip.get_frame(1)  # Get frame at 1 second
+        clip.close()
+        
+        img = Image.fromarray(frame)
+        img.save(output_path, "JPEG")
+        
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            logger.info(f"[v0] MoviePy thumbnail generated successfully")
+            return True
+    except Exception as e:
+        logger.warning(f"[v0] MoviePy thumbnail failed: {e}")
+    return False
+
+async def generate_video_thumbnail_opencv(video_path: str, output_path: str) -> bool:
+    """Generate thumbnail using opencv"""
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if cap.isOpened():
+            # Skip to 1 second mark
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_num = int(fps * 1) if fps > 0 else 30
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            
+            ret, frame = cap.read()
+            cap.release()
+            
+            if ret and frame is not None:
+                cv2.imwrite(output_path, frame)
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+                    logger.info(f"[v0] OpenCV thumbnail generated successfully")
+                    return True
+    except Exception as e:
+        logger.warning(f"[v0] OpenCV thumbnail failed: {e}")
+    return False
+
+async def generate_fallback_thumbnail(video_path: str, output_path: str) -> bool:
+    """Generate a simple fallback thumbnail using PIL"""
+    try:
+        if not PIL_AVAILABLE:
+            return False
+        
+        # Create a simple gradient thumbnail
+        width, height = 320, 180
+        img = Image.new('RGB', (width, height), color='#1a1a1a')
+        draw = ImageDraw.Draw(img)
+        
+        # Draw play button
+        center_x, center_y = width // 2, height // 2
+        triangle_size = 30
+        points = [
+            (center_x - triangle_size, center_y - triangle_size),
+            (center_x - triangle_size, center_y + triangle_size),
+            (center_x + triangle_size, center_y)
+        ]
+        draw.polygon(points, fill='#ffffff')
+        
+        img.save(output_path, "JPEG")
+        logger.info(f"[v0] Fallback thumbnail generated")
+        return True
+    except Exception as e:
+        logger.warning(f"[v0] Fallback thumbnail failed: {e}")
+    return False
+
 async def generate_video_thumbnail(video_path: str, output_path: str) -> bool:
     """
-    Generate thumbnail using ffmpeg (most reliable on Heroku)
+    Generate thumbnail using ffmpeg, moviepy, opencv, or fallback
     Returns True if successful, False otherwise
     """
     if not os.path.exists(video_path):
         logger.warning(f"[v0] Video file not found for thumbnail: {video_path}")
         return False
 
-    # Use ffmpeg - most reliable for Heroku
+    # Try ffmpeg first
     if await generate_video_thumbnail_ffmpeg(video_path, output_path):
+        return True
+
+    # Try moviepy
+    if MOVIEPY_AVAILABLE and await generate_video_thumbnail_moviepy(video_path, output_path):
+        return True
+
+    # Try opencv
+    if OPENCV_AVAILABLE and await generate_video_thumbnail_opencv(video_path, output_path):
+        return True
+
+    # Fallback to simple PIL thumbnail
+    if await generate_fallback_thumbnail(video_path, output_path):
         return True
 
     logger.warning(f"[v0] No thumbnail generated for {video_path}")
@@ -491,3 +604,4 @@ async def help_command(client: Client, message: Message):
         "Send any Bunkr / Cyberdrop link.\n"
         "Progress updates + auto upload supported."
     )
+
