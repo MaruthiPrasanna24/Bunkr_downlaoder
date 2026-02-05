@@ -6,19 +6,15 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from dotenv import load_dotenv
 import logging
-from dump import (
-    get_items_list,
-    create_session,
-    get_and_prepare_download_path,
-    get_real_download_url,
-    get_url_data
-)
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, unquote
 from bs4 import BeautifulSoup
 from pyrogram.errors import MessageNotModified
+import json
+from math import floor
+from base64 import b64decode
 
 try:
     from moviepy.editor import VideoFileClip
@@ -185,6 +181,71 @@ async def generate_video_thumbnail(video_path: str, output_path: str) -> bool:
     logger.warning("No thumbnail generated - neither moviepy nor opencv worked")
     return False
 
+# Functions from dump.py (integrated and fixed)
+
+BUNKR_VS_API_URL_FOR_SLUG = "https://bunkr.cr/api/vs"
+SECRET_KEY_BASE = "SECRET_KEY_"
+
+def create_session():
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+        'Referer': 'https://bunkr.su/',
+    })
+    return session
+
+def get_and_prepare_download_path(custom_path, album_name):
+    album_name = re.sub(r'[<>:"/\\|?*\']|[\0-\31]', "-", album_name).strip() if album_name else "album"
+    final_path = custom_path if custom_path else DOWNLOADS_DIR
+    final_path = os.path.join(final_path, album_name)
+    if not os.path.isdir(final_path):
+        os.makedirs(final_path)
+    return final_path
+
+def get_real_download_url(session, url, is_bunkr=True, item_name=None):
+    if is_bunkr:
+        url = url if url.startswith('https') else f'https://bunkr.su{url}'
+    else:
+        url = url.replace('/f/','/api/f/')
+
+    r = session.get(url)
+    if r.status_code != 200:
+        logger.warning(f"HTTP {r.status_code} getting real url for {url}")
+        return None
+
+    if is_bunkr:
+        # Fixed: use basename instead of faulty regex
+        slug = unquote(os.path.basename(urlparse(url).path))
+        encryption_data = get_encryption_data(session, slug)
+        if not encryption_data:
+            return None
+        decrypted_url = decrypt_encrypted_url(encryption_data)
+        return {'url': decrypted_url, 'name': item_name}
+    else:
+        try:
+            item_data = json.loads(r.content)
+            return {'url': item_data['url'], 'name': item_data['name']}
+        except:
+            return None
+
+def get_encryption_data(session, slug=None):
+    r = session.post(BUNKR_VS_API_URL_FOR_SLUG, json={'slug': slug})
+    if r.status_code != 200:
+        logger.warning(f"HTTP {r.status_code} getting encryption data")
+        return None
+    return json.loads(r.content)
+
+def decrypt_encrypted_url(encryption_data):
+    secret_key = f"{SECRET_KEY_BASE}{floor(encryption_data['timestamp'] / 3600)}"
+    encrypted_url_bytearray = list(b64decode(encryption_data['url']))
+    secret_key_byte_array = list(secret_key.encode('utf-8'))
+    decrypted_url = ""
+    for i in range(len(encrypted_url_bytearray)):
+        decrypted_url += chr(encrypted_url_bytearray[i] ^ secret_key_byte_array[i % len(secret_key_byte_array)])
+    return decrypted_url
+
+# End of integrated functions
+
 async def download_and_send_file(client: Client, message: Message, url: str, session: requests.Session):
     try:
         logger.info(f"[v0] Starting download_and_send_file for: {url}")
@@ -257,7 +318,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             )
 
             success = False
-            max_retries = 4
+            max_retries = 10  # Increased for better reliability
             for attempt in range(max_retries):
                 try:
                     headers = {
@@ -265,16 +326,53 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         "Referer": "https://bunkr.su/"
                     }
                     response = session.get(file_url, stream=True, timeout=60, headers=headers)
-                    if response.status_code == 200:
-                        success = True
-                        break
-                    elif response.status_code == 404:
-                        logger.warning(f"HTTP 404 for {file_url} on attempt {attempt+1}")
-                        break  # No retry for 404
-                    else:
+                    if response.status_code != 200:
+                        if response.status_code == 404:
+                            break
                         logger.warning(f"HTTP {response.status_code} on attempt {attempt+1}")
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+
+                    file_size = int(response.headers.get("content-length", 0))
+                    final_path = os.path.join(download_path, file_name)
+                    downloaded = 0
+                    start_time = time.time()
+                    last_update = start_time
+
+                    with open(final_path, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=8192 * 4):  # Larger chunk for large files
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                current_time = time.time()
+                                if current_time - last_update >= 5 and file_size > 0:
+                                    percent = int((downloaded / file_size) * 100)
+                                    elapsed = current_time - start_time
+                                    speed = downloaded / elapsed if elapsed > 0 else 0
+                                    eta = (file_size - downloaded) / speed if speed > 0 else 0
+                                    bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
+                                    text = (
+                                        f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:25]}\n"
+                                        f"[{bar}] {percent}%\n"
+                                        f"{human_bytes(downloaded)} / {human_bytes(file_size)}\n"
+                                        f"ETA: {int(eta // 60)}m {int(eta % 60)}s"
+                                    )
+                                    if text != last_status:
+                                        await safe_edit(status_msg, text)
+                                        last_status = text
+                                    last_update = current_time
+
+                    # Size check
+                    downloaded_size = os.path.getsize(final_path)
+                    if file_size > 0 and downloaded_size != file_size:
+                        raise ValueError(f"Size mismatch: expected {file_size}, got {downloaded_size}")
+
+                    success = True
+                    break
                 except Exception as e:
-                    logger.warning(f"Attempt {attempt+1} failed: {str(e)}")
+                    logger.warning(f"Attempt {attempt+1} failed for {file_name}: {str(e)}")
+                    if os.path.exists(final_path):
+                        os.remove(final_path)
                     if attempt < max_retries - 1:
                         await asyncio.sleep(2 ** attempt)
 
@@ -285,47 +383,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                     f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (failed after retries)"
                 )
                 logger.error(f"Skipped file: {file_name} - could not download from {file_url}")
-                continue
-
-            file_size = int(response.headers.get("content-length", 0))
-            final_path = os.path.join(download_path, file_name)
-            downloaded = 0
-            start_time = time.time()
-            last_update = start_time
-
-            try:
-                with open(final_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        current_time = time.time()
-                        if current_time - last_update >= 5 and file_size > 0:
-                            percent = int((downloaded / file_size) * 100)
-                            elapsed = current_time - start_time
-                            speed = downloaded / elapsed if elapsed > 0 else 0
-                            eta = (file_size - downloaded) / speed if speed > 0 else 0
-                            bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
-                            text = (
-                                f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:25]}\n"
-                                f"[{bar}] {percent}%\n"
-                                f"{human_bytes(downloaded)} / {human_bytes(file_size)}\n"
-                                f"ETA: {int(eta // 60)}m {int(eta % 60)}s"
-                            )
-                            if text != last_status:
-                                await safe_edit(status_msg, text)
-                                last_status = text
-                            last_update = current_time
-            except Exception as download_err:
-                skipped_files.append(file_name)
-                await safe_edit(
-                    status_msg,
-                    f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (download error)"
-                )
-                logger.exception(f"Download failed for {file_name}: {download_err}")
-                if os.path.exists(final_path):
-                    os.remove(final_path)
                 continue
 
             # Get duration, width, height
@@ -469,5 +526,17 @@ def start_bot():
     logger.info("Bot starting...")
     app.run()
 
+# Add dummy Flask server for Render deployment (use background worker if possible)
+from flask import Flask
+import threading
+
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def index():
+    return "Bunkr Downloader Bot is running!"
+
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    threading.Thread(target=flask_app.run, kwargs={"host": "0.0.0.0", "port": port, "threaded": True, "use_reloader": False}).start()
     start_bot()
