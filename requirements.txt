@@ -9,6 +9,11 @@ tgcrypto==1.2.5
 python-dotenv==1.0.0
 flask==3.0.0
 
+pillow==10.0.0
+moviepy==1.0.3
+numpy==1.24.3
+
+
 # ──────────────── added for video thumbnails ────────────────
 opencv-python>=4.8.0
 # moviepy>=1.0.3     # ← uncomment if you prefer moviepy instead
