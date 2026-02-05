@@ -428,7 +428,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         logger.exception(e)
         await message.reply_text(f"❌ Critical error (album aborted): {str(e)[:100]}")
 
-@app.on_message(filters.text)
+@app.on_message(filters.text & (filters.private | filters.group))
 async def handle_message(client: Client, message: Message):
     urls = extract_urls(message.text)
     unique_urls = list(set(urls))  # Deduplicate URLs to prevent multiple processing
@@ -465,9 +465,3 @@ async def help_command(client: Client, message: Message):
         "Progress updates + auto upload supported."
     )
 
-def start_bot():
-    logger.info("Bot starting...")
-    app.run()
-
-if __name__ == "__main__":
-    start_bot()
