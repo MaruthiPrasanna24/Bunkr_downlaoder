@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import time
+import signal
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from dotenv import load_dotenv
@@ -52,6 +53,14 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
+
+# Signal handler for graceful shutdown
+def shutdown_handler(signum, frame):
+    logger.info("Received shutdown signal. Exiting...")
+    exit(0)
+
+signal.signal(signal.SIGTERM, shutdown_handler)
+signal.signal(signal.SIGINT, shutdown_handler)
 
 URL_PATTERN = r'(https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|net|to)|bunkrrr\.org|cyberdrop\.(?:me|cr|to|cc|nl))[^\s]+)'
 
@@ -108,15 +117,18 @@ async def upload_progress(current, total, status_msg, file_name, idx, total_item
     await safe_edit(status_msg, text)
 
 def fix_bunkr_url(url: str) -> str:
-    """Fix unstable Bunkr CDN domains"""
+    """Fix unstable Bunkr CDN domains with more alternatives"""
     replacements = [
-        ("c.bunkr-cache.se", "c.bunkr.su"),
-        ("bunkr-cache.se", "bunkr.su"),
-        ("c.bunkr.is", "c.bunkr.su"),
-        ("c.bunkr.su", "c.bunkr.la"),  # Added fallback to another potentially stable domain
-        ("bunkr.su", "bunkr.la"),
-        ("c.bunkr.cr", "c.bunkr.la"),
-        ("bunkr.cr", "bunkr.la"),
+        ("c.bunkr-cache.se", "c.bunkr.si"),
+        ("bunkr-cache.se", "bunkr.si"),
+        ("c.bunkr.is", "c.bunkr.si"),
+        ("c.bunkr.su", "c.bunkr.si"),
+        ("bunkr.su", "bunkr.si"),
+        ("c.bunkr.cr", "c.bunkr.fi"),
+        ("bunkr.cr", "bunkr.fi"),
+        ("c.bunkr.la", "c.bunkr.fi"),
+        ("bunkr.la", "bunkr.fi"),
+        ("c.bunkr.media", "c.bunkr.si"),  # Redirect invalid .media
     ]
     for old, new in replacements:
         url = url.replace(old, new)
@@ -311,9 +323,9 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         last_status = ""
         is_bunkr = "bunkr" in url or "bunkrrr" in url
         logger.info(f"[v0] is_bunkr: {is_bunkr}")
-        url = url.replace("bunkr.pk", "bunkr.su").replace("bunkr.is", "bunkr.su")
+        url = url.replace("bunkr.pk", "bunkr.si").replace("bunkr.is", "bunkr.si")
         if is_bunkr and not url.startswith("https"):
-            url = f"https://bunkr.su{url}"
+            url = f"https://bunkr.si{url}"
         r = session.get(url, timeout=30)
         if r.status_code != 200:
             await safe_edit(status_msg, f"❌ HTTP {r.status_code} on album page")
@@ -348,6 +360,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         await safe_edit(status_msg, f"📥 Found {len(items)} items. Starting...")
         skipped_files = []
         seen_urls = set()
+        alt_domains = ["c.bunkr.si", "c.bunkr.fi", "c.bunkr.la"]  # Cycle through valid alternatives
         for idx, item in enumerate(items, 1):
             if isinstance(item, dict):
                 file_url = item.get("url")
@@ -365,52 +378,51 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:30]}"
             )
             success = False
-            max_retries = 7  # Increased retries
-            for attempt in range(max_retries):
-                try:
-                    headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        "Referer": "https://bunkr.su/"
-                    }
-                    response = session.get(file_url, stream=True, timeout=120, headers=headers)  # Increased timeout to 120s
-                    if response.status_code == 200:
-                        success = True
-                        break
-                    elif response.status_code == 404:
-                        logger.warning(f"HTTP 404 for {file_url} on attempt {attempt+1}")
-                        break
-                    else:
-                        logger.warning(f"HTTP {response.status_code} on attempt {attempt+1}")
-                except requests.exceptions.ConnectTimeout as e:
-                    logger.warning(f"Connect timeout on attempt {attempt+1}: {str(e)}")
+            max_retries = 3  # Reduced to prevent hangs
+            current_url = file_url
+            for alt_idx, alt_base in enumerate(alt_domains):
+                if alt_idx > 0:
+                    current_url = current_url.replace(alt_domains[alt_idx-1], alt_base)
+                    logger.info(f"Trying alternative domain: {current_url}")
+                for attempt in range(max_retries):
+                    try:
+                        headers = {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                            "Referer": "https://bunkr.si/",
+                            "Accept": "*/*",
+                            "Connection": "keep-alive"
+                        }
+                        response = session.get(current_url, stream=True, timeout=180, headers=headers)  # Increased to 180s
+                        if response.status_code == 200:
+                            success = True
+                            break
+                        elif response.status_code in [403, 404]:
+                            logger.warning(f"HTTP {response.status_code} for {current_url} on attempt {attempt+1}")
+                            break  # No point retrying forbidden/not found
+                        else:
+                            logger.warning(f"HTTP {response.status_code} on attempt {attempt+1}")
+                    except requests.exceptions.ConnectTimeout as e:
+                        logger.warning(f"Connect timeout on attempt {attempt+1}: {str(e)}")
+                    except requests.exceptions.ReadTimeout as e:
+                        logger.warning(f"Read timeout on attempt {attempt+1}: {str(e)}")
+                    except requests.exceptions.ConnectionError as e:
+                        if "NameResolutionError" in str(e):
+                            logger.warning(f"DNS resolution failed for {current_url}: {str(e)}. Skipping this domain.")
+                            break  # Skip to next alt domain
+                        logger.warning(f"Connection error on attempt {attempt+1}: {str(e)}")
+                    except Exception as e:
+                        logger.warning(f"Attempt {attempt+1} failed: {str(e)}")
                     if attempt < max_retries - 1:
-                        await asyncio.sleep(2 ** attempt + 5)  # Increased backoff
-                except requests.exceptions.ReadTimeout as e:
-                    logger.warning(f"Read timeout on attempt {attempt+1}: {str(e)}")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(2 ** attempt + 5)
-                except Exception as e:
-                    logger.warning(f"Attempt {attempt+1} failed: {str(e)}")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(2 ** attempt + 5)
-            if not success:
-                # Try alternative domain as last resort
-                alt_file_url = file_url.replace("c.bunkr.la", "c.bunkr.media")  # Example alternative
-                try:
-                    response = session.get(alt_file_url, stream=True, timeout=120, headers=headers)
-                    if response.status_code == 200:
-                        file_url = alt_file_url
-                        success = True
-                        logger.info(f"Success with alternative URL: {alt_file_url}")
-                except Exception as alt_e:
-                    logger.warning(f"Alternative URL failed: {str(alt_e)}")
+                        await asyncio.sleep(2 ** attempt)  # Reduced backoff: 1s, 2s, 4s
+                if success:
+                    break
             if not success:
                 skipped_files.append(file_name)
                 await safe_edit(
                     status_msg,
-                    f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (failed after retries)"
+                    f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (failed after retries and alts)"
                 )
-                logger.error(f"Skipped file: {file_name} - could not download from {file_url}")
+                logger.error(f"Skipped file: {file_name} - could not download from {file_url} or alts")
                 continue
             file_size = int(response.headers.get("content-length", 0))
             final_path = os.path.join(download_path, file_name)
@@ -418,29 +430,39 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             start_time = time.time()
             last_update = start_time
             try:
-                with open(final_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        current_time = time.time()
-                        if current_time - last_update >= 5 and file_size > 0:
-                            percent = int((downloaded / file_size) * 100)
-                            elapsed = current_time - start_time
-                            speed = downloaded / elapsed if elapsed > 0 else 0
-                            eta = (file_size - downloaded) / speed if speed > 0 else 0
-                            bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
-                            text = (
-                                f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:25]}\n"
-                                f"[{bar}] {percent}%\n"
-                                f"{human_bytes(downloaded)} / {human_bytes(file_size)}\n"
-                                f"ETA: {int(eta // 60)}m {int(eta % 60)}s"
-                            )
-                            if text != last_status:
-                                await safe_edit(status_msg, text)
-                                last_status = text
-                            last_update = current_time
+                async def download_with_timeout():
+                    with open(final_path, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=4096):  # Smaller chunks for faster progress
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            current_time = time.time()
+                            if current_time - last_update >= 3 and file_size > 0:  # More frequent updates
+                                percent = int((downloaded / file_size) * 100)
+                                elapsed = current_time - start_time
+                                speed = downloaded / elapsed if elapsed > 0 else 0
+                                eta = (file_size - downloaded) / speed if speed > 0 else 0
+                                bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
+                                text = (
+                                    f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:25]}\n"
+                                    f"[{bar}] {percent}%\n"
+                                    f"{human_bytes(downloaded)} / {human_bytes(file_size)}\n"
+                                    f"ETA: {int(eta // 60)}m {int(eta % 60)}s"
+                                )
+                                if text != last_status:
+                                    await safe_edit(status_msg, text)
+                                    last_status = text
+                                last_update = current_time
+                # Limit entire download to 10min to prevent hangs
+                await asyncio.wait_for(download_with_timeout(), timeout=600)
+            except asyncio.TimeoutError:
+                logger.error(f"Download timed out after 10min for {file_name}")
+                skipped_files.append(file_name)
+                await safe_edit(status_msg, f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (total timeout)")
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+                continue
             except Exception as download_err:
                 skipped_files.append(file_name)
                 await safe_edit(
@@ -459,7 +481,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             if is_video:
                 logger.info(f"[v0] Getting video metadata for {file_name}")
                 duration = get_video_duration(final_path)
-                logger.info(f"[v0] Duration result: {duration if duration else 'None (ffmpeg not available)'}s")
+                logger.info(f"[v0] Duration result: {duration if duration else 'None'}s")
                 # Get resolution
                 width, height = get_video_resolution_ffprobe(final_path)
                 if width is None and MOVIEPY_AVAILABLE:
@@ -501,7 +523,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             try:
                 with open(final_path, "rb") as f:
                     if is_video:
-                        # Only pass parameters if they have valid values
                         send_kwargs = {
                             "chat_id": message.chat.id,
                             "video": f,
@@ -510,8 +531,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             "progress": upload_progress,
                             "progress_args": (status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         }
-                        
-                        # Add optional parameters only if they're not None
                         if thumb_path and os.path.exists(thumb_path):
                             send_kwargs["thumb"] = thumb_path
                         if duration is not None and duration > 0:
@@ -520,7 +539,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             send_kwargs["width"] = width
                         if height is not None and height > 0:
                             send_kwargs["height"] = height
-                        
                         await client.send_video(**send_kwargs)
                     elif file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
                         await client.send_photo(
@@ -565,8 +583,8 @@ async def handle_message(client: Client, message: Message):
         return
     session = create_session()
     retry_strategy = Retry(
-        total=10,  # Increased total retries
-        backoff_factor=2,  # Increased backoff factor
+        total=10,
+        backoff_factor=1,  # Reduced for faster retries
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
     )
