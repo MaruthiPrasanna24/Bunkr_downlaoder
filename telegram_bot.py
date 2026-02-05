@@ -22,6 +22,7 @@ from pyrogram.errors import MessageNotModified
 import subprocess
 import json
 
+# Optional imports with fallbacks
 try:
     from moviepy.editor import VideoFileClip
     MOVIEPY_AVAILABLE = True
@@ -57,14 +58,17 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
+# URL pattern for extraction
 URL_PATTERN = r'(https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|net|to)|bunkrrr\.org|cyberdrop\.(?:me|cr|to|cc|nl))[^\s]+)'
 
 def extract_urls(text):
+    """Extract URLs from text"""
     matches = re.findall(URL_PATTERN, text)
     logger.info(f"[v0] URL_PATTERN matches: {matches}")
     return matches
 
 def is_valid_bunkr_url(url):
+    """Validate if URL is a valid Bunkr or Cyberdrop URL"""
     is_valid = bool(
         re.match(r'https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|net|to)|bunkrrr\.org|cyberdrop\.(?:me|cr|to|cc|nl))', url)
     )
@@ -82,6 +86,7 @@ async def safe_edit(msg, text):
         logger.warning(f"[v0] edit_text failed: {e}")
 
 def human_bytes(size):
+    """Convert bytes to human readable format"""
     if size < 1024:
         return f"{size} B"
     elif size < 1024**2:
@@ -92,6 +97,7 @@ def human_bytes(size):
         return f"{size / 1024**3:.2f} GB"
 
 async def upload_progress(current, total, status_msg, file_name, idx, total_items, last_update_time, start_time):
+    """Update upload progress"""
     if total == 0:
         return
     current_time = time.time()
@@ -135,6 +141,40 @@ def get_video_duration_ffprobe(video_path: str) -> int:
         logger.warning(f"[v0] ffprobe duration failed: {e}")
     return None
 
+def get_video_duration_moviepy(video_path: str) -> int:
+    """Get video duration using moviepy"""
+    if not MOVIEPY_AVAILABLE:
+        return None
+    try:
+        clip = VideoFileClip(video_path)
+        duration = int(clip.duration)
+        clip.close()
+        if duration > 0:
+            logger.info(f"[v0] MoviePy duration: {duration}s")
+            return duration
+    except Exception as e:
+        logger.warning(f"[v0] MoviePy duration failed: {e}")
+    return None
+
+def get_video_duration_opencv(video_path: str) -> int:
+    """Get video duration using opencv"""
+    if not OPENCV_AVAILABLE:
+        return None
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if cap.isOpened():
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            cap.release()
+            if fps > 0 and frame_count > 0:
+                duration = int(frame_count / fps)
+                if duration > 0:
+                    logger.info(f"[v0] OpenCV duration: {duration}s")
+                    return duration
+    except Exception as e:
+        logger.warning(f"[v0] OpenCV duration failed: {e}")
+    return None
+
 def get_video_duration(video_path: str) -> int:
     """
     Returns video duration in seconds (int) or None if failed
@@ -150,32 +190,14 @@ def get_video_duration(video_path: str) -> int:
         return duration
 
     # Fallback to moviepy
-    if MOVIEPY_AVAILABLE:
-        try:
-            clip = VideoFileClip(video_path)
-            duration = int(clip.duration)
-            clip.close()
-            if duration > 0:
-                logger.info(f"[v0] MoviePy duration: {duration}s")
-                return duration
-        except Exception as e:
-            logger.warning(f"[v0] MoviePy duration failed: {e}")
+    duration = get_video_duration_moviepy(video_path)
+    if duration is not None and duration > 0:
+        return duration
 
     # Fallback to opencv
-    if OPENCV_AVAILABLE:
-        try:
-            cap = cv2.VideoCapture(video_path)
-            if cap.isOpened():
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                cap.release()
-                if fps > 0 and frame_count > 0:
-                    duration = int(frame_count / fps)
-                    if duration > 0:
-                        logger.info(f"[v0] OpenCV duration: {duration}s")
-                        return duration
-        except Exception as e:
-            logger.warning(f"[v0] OpenCV duration failed: {e}")
+    duration = get_video_duration_opencv(video_path)
+    if duration is not None and duration > 0:
+        return duration
 
     logger.warning(f"[v0] Could not determine video duration for {video_path}")
     return None
@@ -199,6 +221,36 @@ def get_video_resolution_ffprobe(video_path: str) -> tuple:
         logger.warning(f"[v0] ffprobe resolution failed: {e}")
     return (None, None)
 
+def get_video_resolution_moviepy(video_path: str) -> tuple:
+    """Get video resolution using moviepy"""
+    if not MOVIEPY_AVAILABLE:
+        return (None, None)
+    try:
+        clip = VideoFileClip(video_path)
+        width, height = clip.size
+        clip.close()
+        logger.info(f"[v0] MoviePy resolution: {width}x{height}")
+        return (width, height)
+    except Exception as e:
+        logger.warning(f"[v0] MoviePy resolution failed: {e}")
+    return (None, None)
+
+def get_video_resolution_opencv(video_path: str) -> tuple:
+    """Get video resolution using opencv"""
+    if not OPENCV_AVAILABLE:
+        return (None, None)
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if cap.isOpened():
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            logger.info(f"[v0] OpenCV resolution: {width}x{height}")
+            return (width, height)
+    except Exception as e:
+        logger.warning(f"[v0] OpenCV resolution failed: {e}")
+    return (None, None)
+
 async def generate_video_thumbnail_ffmpeg(video_path: str, output_path: str) -> bool:
     """Generate thumbnail using ffmpeg"""
     try:
@@ -216,6 +268,8 @@ async def generate_video_thumbnail_ffmpeg(video_path: str, output_path: str) -> 
 
 async def generate_video_thumbnail_moviepy(video_path: str, output_path: str) -> bool:
     """Generate thumbnail using moviepy"""
+    if not MOVIEPY_AVAILABLE:
+        return False
     try:
         clip = VideoFileClip(video_path)
         frame = clip.get_frame(1)  # Get frame at 1 second
@@ -233,6 +287,8 @@ async def generate_video_thumbnail_moviepy(video_path: str, output_path: str) ->
 
 async def generate_video_thumbnail_opencv(video_path: str, output_path: str) -> bool:
     """Generate thumbnail using opencv"""
+    if not OPENCV_AVAILABLE:
+        return False
     try:
         cap = cv2.VideoCapture(video_path)
         if cap.isOpened():
@@ -255,10 +311,9 @@ async def generate_video_thumbnail_opencv(video_path: str, output_path: str) -> 
 
 async def generate_fallback_thumbnail(video_path: str, output_path: str) -> bool:
     """Generate a simple fallback thumbnail using PIL"""
+    if not PIL_AVAILABLE:
+        return False
     try:
-        if not PIL_AVAILABLE:
-            return False
-        
         # Create a simple gradient thumbnail
         width, height = 320, 180
         img = Image.new('RGB', (width, height), color='#1a1a1a')
@@ -310,6 +365,7 @@ async def generate_video_thumbnail(video_path: str, output_path: str) -> bool:
     return False
 
 async def download_and_send_file(client: Client, message: Message, url: str, session: requests.Session):
+    """Download and send files from Bunkr/Cyberdrop"""
     try:
         logger.info(f"[v0] Starting download_and_send_file for: {url}")
         status_msg = await message.reply_text(f"🔄 Processing: {url[:50]}...")
@@ -466,24 +522,10 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
 
                 # Get resolution
                 width, height = get_video_resolution_ffprobe(final_path)
-                if width is None and MOVIEPY_AVAILABLE:
-                    try:
-                        clip = VideoFileClip(final_path)
-                        width, height = clip.size
-                        clip.close()
-                        logger.info(f"[v0] MoviePy resolution: {width}x{height}")
-                    except Exception as e:
-                        logger.warning(f"[v0] MoviePy resolution failed: {e}")
-                if width is None and OPENCV_AVAILABLE:
-                    try:
-                        cap = cv2.VideoCapture(final_path)
-                        if cap.isOpened():
-                            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                            cap.release()
-                            logger.info(f"[v0] OpenCV resolution: {width}x{height}")
-                    except Exception as e:
-                        logger.warning(f"[v0] OpenCV resolution failed: {e}")
+                if width is None:
+                    width, height = get_video_resolution_moviepy(final_path)
+                if width is None:
+                    width, height = get_video_resolution_opencv(final_path)
 
             # Thumbnail generation
             thumb_path = None
@@ -511,97 +553,131 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                     if is_video:
                         # Only pass parameters if they have valid values
                         send_kwargs = {
-                            "chat_id": message.chat.id,
-                            "video": f,
-                            "caption": f" {file_name}",
-                            "supports_streaming": True,
-                            "progress": upload_progress,
-                            "progress_args": (status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
+                            "caption": file_name[:1024] if file_name else "video"
                         }
                         
-                        # Add optional parameters only if they're not None
-                        if thumb_path and os.path.exists(thumb_path):
-                            send_kwargs["thumb"] = thumb_path
-                        if duration is not None and duration > 0:
+                        if duration and duration > 0:
                             send_kwargs["duration"] = duration
-                        if width is not None and width > 0:
+                        
+                        if width and height and width > 0 and height > 0:
                             send_kwargs["width"] = width
-                        if height is not None and height > 0:
                             send_kwargs["height"] = height
                         
-                        await client.send_video(**send_kwargs)
-                    elif file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
-                        await client.send_photo(
+                        if thumb_path and os.path.exists(thumb_path):
+                            try:
+                                send_kwargs["thumb"] = open(thumb_path, "rb")
+                            except:
+                                pass
+                        
+                        await client.send_video(
                             message.chat.id,
-                            f,
-                            caption=f" {file_name}",
+                            final_path,
                             progress=upload_progress,
-                            progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
+                            progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time),
+                            **send_kwargs
                         )
+                        
+                        # Close thumb file if it was opened
+                        if "thumb" in send_kwargs and hasattr(send_kwargs["thumb"], "close"):
+                            send_kwargs["thumb"].close()
                     else:
                         await client.send_document(
                             message.chat.id,
-                            f,
-                            caption=f" {file_name}",
+                            final_path,
+                            caption=file_name[:1024] if file_name else "document",
                             progress=upload_progress,
                             progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         )
+
+                logger.info(f"[v0] Upload successful for {file_name}")
+                await safe_edit(status_msg, f"✅ Uploaded [{idx}/{len(items)}]: {file_name[:30]}")
+
             except Exception as upload_err:
-                logger.exception(f"Upload failed for {file_name}: {upload_err}")
-                await safe_edit(status_msg, f"⚠️ Upload failed for {file_name[:30]} (but file was downloaded)")
+                logger.error(f"[v0] Upload failed for {file_name}: {upload_err}")
+                await safe_edit(
+                    status_msg,
+                    f"❌ Upload failed [{idx}/{len(items)}]: {file_name[:30]}"
+                )
 
             # Cleanup
-            if os.path.exists(final_path):
-                os.remove(final_path)
             if thumb_path and os.path.exists(thumb_path):
-                os.remove(thumb_path)
+                try:
+                    os.remove(thumb_path)
+                except:
+                    pass
 
-        # Final summary
-        summary = f"✅ Done! {album_name}\n"
+            if os.path.exists(final_path):
+                try:
+                    os.remove(final_path)
+                except:
+                    pass
+
+        # Final message
         if skipped_files:
-            summary += f"⚠️ Skipped {len(skipped_files)} file(s): {', '.join(skipped_files[:3])}"
-            if len(skipped_files) > 3:
-                summary += f" + {len(skipped_files)-3} more"
-        await safe_edit(status_msg, summary)
+            skipped_text = "\n".join(skipped_files[:5])
+            if len(skipped_files) > 5:
+                skipped_text += f"\n... and {len(skipped_files) - 5} more"
+            await safe_edit(
+                status_msg,
+                f"✅ Download complete!\n\n⚠️ Skipped {len(skipped_files)} files:\n{skipped_text}"
+            )
+        else:
+            await safe_edit(status_msg, "✅ Download complete!")
 
     except Exception as e:
-        logger.exception(e)
-        await message.reply_text(f"❌ Critical error (album aborted): {str(e)[:100]}")
-
-@app.on_message(filters.text & (filters.private | filters.group))
-async def handle_message(client: Client, message: Message):
-    urls = extract_urls(message.text)
-    unique_urls = list(set(urls))
-    if not unique_urls:
-        return
-
-    session = create_session()
-    retry_strategy = Retry(
-        total=7,
-        backoff_factor=1.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-
-    for url in unique_urls:
-        if is_valid_bunkr_url(url):
-            await download_and_send_file(client, message, url, session)
+        logger.exception(f"[v0] Error in download_and_send_file: {e}")
+        try:
+            await message.reply_text(f"❌ Error: {str(e)[:200]}")
+        except:
+            pass
 
 @app.on_message(filters.command("start"))
-async def start_command(client: Client, message: Message):
-    await message.reply_text(
-        "🤖 **Bunkr Downloader Bot**\n\n"
-        "Send Bunkr or Cyberdrop links.\n"
-        "The bot will download & upload automatically."
-    )
+async def start_handler(client: Client, message: Message):
+    """Handle /start command"""
+    await message.reply_text("👋 Welcome to Bunkr Downloader Bot!\n\nSend me a Bunkr or Cyberdrop URL to download content.")
 
 @app.on_message(filters.command("help"))
-async def help_command(client: Client, message: Message):
-    await message.reply_text(
-        "Send any Bunkr / Cyberdrop link.\n"
-        "Progress updates + auto upload supported."
-    )
+async def help_handler(client: Client, message: Message):
+    """Handle /help command"""
+    help_text = """
+📋 **Available Commands:**
+/start - Welcome message
+/help - Show this help
+/about - About the bot
 
+**How to use:**
+Just send a Bunkr or Cyberdrop URL and I'll download and upload the content!
+
+**Supported sites:**
+• bunkr.sk, bunkr.su, bunkr.ru, etc.
+• cyberdrop.me and variants
+• bunkrrr.org
+
+🔒 **Privacy:** All downloads are temporary and deleted after upload.
+    """
+    await message.reply_text(help_text)
+
+@app.on_message(filters.command("about"))
+async def about_handler(client: Client, message: Message):
+    """Handle /about command"""
+    await message.reply_text("🤖 Bunkr Downloader Bot\nDownloads files from Bunkr and Cyberdrop and uploads them to Telegram!")
+
+@app.on_message(filters.text & ~filters.command(["start", "help", "about"]))
+async def handle_message(client: Client, message: Message):
+    """Handle text messages with URLs"""
+    text = message.text
+    urls = extract_urls(text)
+
+    if not urls:
+        await message.reply_text("❌ No valid Bunkr/Cyberdrop URLs found.\n\nSupported sites:\n• bunkr.* (all domains)\n• bunkrrr.org\n• cyberdrop.*")
+        return
+
+    logger.info(f"[v0] Found {len(urls)} URLs in message")
+
+    session = create_session()
+
+    for url in urls:
+        if is_valid_bunkr_url(url):
+            await download_and_send_file(client, message, url, session)
+        else:
+            await message.reply_text(f"❌ Invalid URL: {url}")
