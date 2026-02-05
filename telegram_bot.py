@@ -141,7 +141,6 @@ def get_video_duration_ffprobe(video_path: str) -> int:
                     pass
     except Exception as e:
         logger.debug(f"[v0] Stream duration probe failed: {e}")
-
     # 2. Try format duration
     try:
         r = subprocess.run(
@@ -165,7 +164,6 @@ def get_video_duration_ffprobe(video_path: str) -> int:
                     pass
     except Exception as e:
         logger.debug(f"[v0] Format duration probe failed: {e}")
-
     # 3. Last resort: estimate from frame count + fps
     try:
         r = subprocess.run(
@@ -187,7 +185,7 @@ def get_video_duration_ffprobe(video_path: str) -> int:
                     num, den = map(int, lines[1].split('/'))
                     fps = num / den
                     if fps > 0:
-                        duration = int(frames / fps) + 1  # small safety margin
+                        duration = int(frames / fps) + 1 # small safety margin
                         if duration > 0:
                             logger.info(f"[v0] Estimated duration from frames: {duration}s")
                             return duration
@@ -195,7 +193,6 @@ def get_video_duration_ffprobe(video_path: str) -> int:
                     pass
     except Exception as e:
         logger.debug(f"[v0] Frame count estimation failed: {e}")
-
     logger.warning(f"[v0] All duration probes failed for {os.path.basename(video_path)} → using fallback 1s")
     return 1
 
@@ -223,22 +220,65 @@ def get_video_resolution_ffprobe(video_path: str) -> tuple:
     return (None, None)
 
 async def generate_video_thumbnail_ffmpeg(video_path: str, output_path: str) -> bool:
+    """
+    Improved Telegram thumbnail:
+    - Preserves video aspect ratio
+    - Scales to max 320px on the longer side
+    - No forced black bars (unless extremely narrow/tall video)
+    - Good quality, clean look in chat
+    - Tries to avoid black intro frames
+    """
     try:
-        # Better thumbnail for Telegram: small square-ish, good quality
+        # ── Modern clean style: fit inside ~320×320 without forced padding ──
         cmd = [
-            "ffmpeg", "-i", video_path,
-            "-ss", "00:00:01",
+            "ffmpeg",
+            "-i", video_path,
+            "-ss", "00:00:01.5",               # slightly later → better chance of real content
             "-vframes", "1",
-            "-vf", "scale=320:320:force_original_aspect_ratio=decrease,pad=320:320:(ow-iw)/2:(oh-ih)/2",
-            "-q:v", "2",
-            "-y", output_path
+            # Scale so the longer side becomes 320, keep aspect ratio
+            "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+            "-q:v", "2",                       # quality 2 = good visual / reasonable size
+            "-y",
+            output_path
         ]
-        subprocess.run(cmd, capture_output=True, timeout=15)
-        if os.path.exists(output_path) and os.path.getsize(output_path) >= 8000:  # Telegram likes > ~10KB
-            logger.info(f"[v0] Thumbnail generated OK → {output_path} ({os.path.getsize(output_path)} bytes)")
-            return True
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=12
+        )
+
+        if result.returncode != 0:
+            logger.warning(f"Thumbnail ffmpeg error: {result.stderr.strip()[:180]}")
+            return False
+
+        if not os.path.exists(output_path):
+            return False
+
+        size = os.path.getsize(output_path)
+        if size < 5000:  # too small → probably bad frame or almost black
+            logger.warning(f"Generated thumbnail too small ({size} bytes) → discarding")
+            try:
+                os.remove(output_path)
+            except:
+                pass
+            return False
+
+        logger.info(f"[v0] Thumbnail OK → {output_path}  ({human_bytes(size)})")
+        return True
+
+    except subprocess.TimeoutExpired:
+        logger.warning("[v0] Thumbnail generation timed out")
     except Exception as e:
-        logger.warning(f"[v0] Thumbnail generation failed: {e}")
+        logger.warning(f"[v0] Thumbnail generation failed: {str(e)}")
+
+    # Cleanup on failure
+    if os.path.exists(output_path):
+        try:
+            os.remove(output_path)
+        except:
+            pass
     return False
 
 # ────────────────────────────────────────────────
@@ -247,23 +287,19 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
     try:
         logger.info(f"[v0] Processing: {url}")
         status_msg = await message.reply_text(f"🔄 Processing: {url[:50]}...")
-
         is_bunkr = "bunkr" in url or "bunkrrr" in url
         url = url.replace("bunkr.pk", "bunkr.su").replace("bunkr.is", "bunkr.su")
         if is_bunkr and not url.startswith("https"):
             url = f"https://bunkr.su{url}"
-
         r = session.get(url, timeout=30)
         if r.status_code != 200:
             await safe_edit(status_msg, f"❌ HTTP {r.status_code}")
             return
-
         soup = BeautifulSoup(r.content, 'html.parser')
         is_direct = (
             soup.find('span', {'class': 'ic-videos'}) or
             soup.find('div', {'class': 'lightgallery'})
         )
-
         items = []
         if is_direct:
             h1 = soup.find('h1', {'class': 'text-[20px]'}) or soup.find('h1', {'class': 'truncate'})
@@ -280,27 +316,20 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                     name = theItem.find("p").get_text(strip=True) if theItem.find("p") else "file"
                     direct = get_real_download_url(session, view_url, True, name)
                     if direct: items.append(direct)
-
         if not items:
             await safe_edit(status_msg, "❌ No files found")
             return
-
         download_path = get_and_prepare_download_path(DOWNLOADS_DIR, album_name)
         await safe_edit(status_msg, f"📥 Found {len(items)} items. Starting...")
-
         skipped = []
         seen = set()
-
         for idx, item in enumerate(items, 1):
             file_url = item["url"] if isinstance(item, dict) else item
             file_name = item.get("name", album_name) if isinstance(item, dict) else album_name
-
             if file_url in seen: continue
             seen.add(file_url)
             file_url = fix_bunkr_url(file_url)
-
             await safe_edit(status_msg, f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:30]}")
-
             success = False
             for attempt in range(4):
                 try:
@@ -311,20 +340,16 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         break
                 except Exception:
                     if attempt < 3: await asyncio.sleep(2 ** attempt)
-
             if not success:
                 skipped.append(file_name)
                 await safe_edit(status_msg, f"⚠️ Skipped {file_name[:30]}")
                 continue
-
             final_path = os.path.join(download_path, file_name)
             file_size = int(resp.headers.get("content-length", 0))
-
             downloaded = 0
             start_t = time.time()
             last_up = start_t
             last_status = ""
-
             try:
                 with open(final_path, "wb") as f:
                     for chunk in resp.iter_content(524288):
@@ -333,7 +358,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         downloaded += len(chunk)
                         now = time.time()
                         if now - last_up >= 5 and file_size > 0:
-                            # progress code (same as before)
                             percent = int(downloaded * 100 / file_size)
                             elapsed = now - start_t
                             speed = downloaded / elapsed if elapsed else 0
@@ -350,19 +374,16 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 skipped.append(file_name)
                 if os.path.exists(final_path): os.remove(final_path)
                 continue
-
             # ── Metadata ───────────────────────────────────────
             duration = 0
             width = None
             height = None
             thumb_path = None
             is_video = file_name.lower().endswith(('.mp4','.mkv','.avi','.mov','.webm'))
-
             if is_video:
                 logger.info(f"[v0] Metadata for {file_name}")
                 duration = get_video_duration_ffprobe(final_path)
                 width, height = get_video_resolution_ffprobe(final_path)
-
                 thumb_file = f"{file_name}_thumb.jpg"
                 thumb_path = os.path.join(download_path, thumb_file)
                 if await generate_video_thumbnail_ffmpeg(final_path, thumb_path):
@@ -371,13 +392,10 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         thumb_path = None
                 else:
                     thumb_path = None
-
             # ── Upload ─────────────────────────────────────────
             await safe_edit(status_msg, f"📤 Uploading [{idx}/{len(items)}]: {file_name[:30]}")
-
             upload_start = time.time()
             last_up_time = [upload_start]
-
             try:
                 with open(final_path, "rb") as f:
                     if is_video:
@@ -388,44 +406,37 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             "supports_streaming": True,
                             "progress": optimized_upload_progress,
                             "progress_args": (status_msg, file_name, idx, len(items), last_up_time, upload_start),
-                            "duration": max(1, duration),           # ← fixed: never 0
-                            "width":  width  if width  and width  > 0 else 720,
+                            "duration": max(1, duration), # ← fixed: never 0
+                            "width": width if width and width > 0 else 720,
                             "height": height if height and height > 0 else 1280,
                         }
                         if thumb_path and os.path.exists(thumb_path):
                             send_kwargs["thumb"] = thumb_path
-
-                        logger.info(f"[v0] send_video → dur={send_kwargs['duration']}s  {send_kwargs['width']}×{send_kwargs['height']}")
+                        logger.info(f"[v0] send_video → dur={send_kwargs['duration']}s {send_kwargs['width']}×{send_kwargs['height']}")
                         await client.send_video(**send_kwargs)
-
                     elif file_name.lower().endswith(('.jpg','.jpeg','.png','.gif','.webp')):
                         await client.send_photo(message.chat.id, f, caption=f" {file_name}",
                                                 progress=optimized_upload_progress,
                                                 progress_args=(status_msg, file_name, idx, len(items), last_up_time, upload_start))
-
                     else:
                         await client.send_document(message.chat.id, f, caption=f" {file_name}",
                                                    progress=optimized_upload_progress,
                                                    progress_args=(status_msg, file_name, idx, len(items), last_up_time, upload_start))
-
                 upload_time = time.time() - upload_start
                 mb = os.path.getsize(final_path) / 1024 / 1024
                 logger.info(f"[v0] Uploaded {file_name} @ {mb/upload_time:.2f} MB/s")
             except Exception as e:
                 logger.exception(f"Upload failed: {file_name}")
                 await safe_edit(status_msg, f"⚠️ Upload failed: {file_name[:30]}")
-
             # Cleanup
             if os.path.exists(final_path): os.remove(final_path)
             if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
-
         # Summary
         summary = f"✅ Done! {album_name}"
         if skipped:
             summary += f"\n⚠️ Skipped {len(skipped)}: {', '.join(skipped[:3])}"
             if len(skipped) > 3: summary += f" +{len(skipped)-3} more"
         await safe_edit(status_msg, summary)
-
     except Exception as e:
         logger.exception(e)
         await message.reply_text(f"❌ Error: {str(e)[:100]}")
@@ -448,4 +459,3 @@ async def start_command(client: Client, message: Message):
 @app.on_message(filters.command("help"))
 async def help_command(client: Client, message: Message):
     await message.reply_text("Send Bunkr / Cyberdrop link.\nSupports albums, videos, photos.\nShows progress + speed.")
-
