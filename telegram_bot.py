@@ -19,6 +19,7 @@ from urllib3.util.retry import Retry
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from pyrogram.errors import MessageNotModified
+import subprocess
 
 load_dotenv()
 API_ID = int(os.getenv('TELEGRAM_API_ID'))
@@ -118,6 +119,54 @@ def fix_bunkr_url(url: str) -> str:
     url = url.replace("bunkr-cache.se", "bunkr.su")
     url = url.replace("c.bunkr.is", "c.bunkr.su")
     return url
+def get_video_duration_ffprobe(video_path: str) -> int:
+    """Get video duration using ffprobe"""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1:noprint_indexes=1", video_path],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            duration = int(float(result.stdout.strip()) + 0.5)
+            logger.info(f"[v0] ffprobe duration: {duration}s")
+            return duration
+    except Exception as e:
+        logger.warning(f"[v0] ffprobe duration failed: {e}")
+    return None
+def get_video_resolution_ffprobe(video_path: str) -> tuple:
+    """Get video resolution using ffprobe"""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", video_path],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            parts = result.stdout.strip().split('x')
+            if len(parts) == 2:
+                width, height = int(parts[0]), int(parts[1])
+                logger.info(f"[v0] ffprobe resolution: {width}x{height}")
+                return (width, height)
+    except Exception as e:
+        logger.warning(f"[v0] ffprobe resolution failed: {e}")
+    return (None, None)
+async def generate_video_thumbnail_ffmpeg(video_path: str, output_path: str) -> bool:
+    """Generate thumbnail using ffmpeg"""
+    try:
+        subprocess.run(
+            ["ffmpeg", "-i", video_path, "-ss", "00:00:01.000", "-vframes", "1", "-y", output_path],
+            capture_output=True,
+            timeout=15
+        )
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            logger.info(f"[v0] ffmpeg thumbnail generated successfully")
+            return True
+    except Exception as e:
+        logger.warning(f"[v0] ffmpeg thumbnail failed: {e}")
+    return False
 # ⚡ OPTIMIZED FILE UPLOAD WITH FASTER SPEED (7-10 MB/s target)
 async def download_and_send_file(client: Client, message: Message, url: str, session: requests.Session):
     try:
@@ -279,7 +328,24 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                     os.remove(final_path)
                 continue
            
+            # Video metadata extraction using only ffprobe/ffmpeg
+            duration = None
+            width = None
+            height = None
+            thumb_path = None
             is_video = file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm'))
+           
+            if is_video:
+                logger.info(f"[v0] Getting video metadata for {file_name}")
+                duration = get_video_duration_ffprobe(final_path)
+                width, height = get_video_resolution_ffprobe(final_path)
+               
+                thumb_filename = f"{file_name}_thumb.jpg"
+                thumb_path = os.path.join(download_path, thumb_filename)
+                logger.info(f"[v0] Generating thumbnail for {file_name}")
+                success_thumb = await generate_video_thumbnail_ffmpeg(final_path, thumb_path)
+                if not success_thumb or not os.path.exists(thumb_path):
+                    thumb_path = None
            
             # ⚡ OPTIMIZED UPLOAD TO TELEGRAM WITH FASTER SPEED
             await safe_edit(
@@ -294,14 +360,26 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 # Open file in binary mode with optimized buffering
                 with open(final_path, "rb") as f:
                     if is_video:
-                        await client.send_video(
-                            chat_id=message.chat.id,
-                            video=f,
-                            caption=f" {file_name}",
-                            supports_streaming=True,
-                            progress=optimized_upload_progress,
-                            progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
-                        )
+                        send_kwargs = {
+                            "chat_id": message.chat.id,
+                            "video": f,
+                            "caption": f" {file_name}",
+                            "supports_streaming": True,
+                            "progress": optimized_upload_progress,
+                            "progress_args": (status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
+                        }
+                       
+                        # Add optional parameters only if they're valid
+                        if thumb_path and os.path.exists(thumb_path):
+                            send_kwargs["thumb"] = thumb_path
+                        if duration is not None and duration > 0:
+                            send_kwargs["duration"] = duration
+                        if width is not None and width > 0:
+                            send_kwargs["width"] = width
+                        if height is not None and height > 0:
+                            send_kwargs["height"] = height
+                       
+                        await client.send_video(**send_kwargs)
                    
                     elif file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
                         await client.send_photo(
@@ -334,6 +412,8 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             # Cleanup
             if os.path.exists(final_path):
                 os.remove(final_path)
+            if thumb_path and os.path.exists(thumb_path):
+                os.remove(thumb_path)
        
         # Final summary
         summary = f"✅ Done! {album_name}\n"
