@@ -381,7 +381,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         await client.send_video(
                             message.chat.id,
                             f,
-                            caption=f"✅ {file_name}",
+                            caption=f" {file_name}",
                             thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
                             duration=duration,
                             width=width if width > 0 else 0,
@@ -394,7 +394,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         await client.send_photo(
                             message.chat.id,
                             f,
-                            caption=f"✅ {file_name}",
+                            caption=f" {file_name}",
                             progress=upload_progress,
                             progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         )
@@ -402,7 +402,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         await client.send_document(
                             message.chat.id,
                             f,
-                            caption=f"✅ {file_name}",
+                            caption=f" {file_name}",
                             progress=upload_progress,
                             progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         )
