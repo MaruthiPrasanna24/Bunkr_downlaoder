@@ -61,17 +61,17 @@ app = Client(
     workdir=".",
 )
 
-# Enhanced session with connection pooling
+# Enhanced session with connection pooling — CHANGED HERE
 def create_optimized_session():
     """Create session with optimized connection pooling"""
     session = requests.Session()
     
-    # Connection pooling with increased pool size
+    # Connection pooling + fewer retries + shorter timeout
     adapter = HTTPAdapter(
         pool_connections=10,
         pool_maxsize=20,
         max_retries=Retry(
-            total=7,
+            total=2,                    # ← changed from 7 to 2
             backoff_factor=1.5,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
@@ -331,7 +331,8 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         if is_bunkr and not url.startswith("https"):
             url = f"https://bunkr.su{url}"
         
-        r = session.get(url, timeout=30)
+        # ← CHANGED TIMEOUT HERE (album page request)
+        r = session.get(url, timeout=10)
         
         if r.status_code != 200:
             await safe_edit(status_msg, f"❌ HTTP {r.status_code} on album page")
@@ -395,7 +396,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             )
             
             success = False
-            max_retries = 2   # ← CHANGED HERE (was 4)
+            max_retries = 2   # ← also reduced here (manual retry loop)
             
             for attempt in range(max_retries):
                 try:
@@ -403,7 +404,8 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                         "Referer": "https://bunkr.su/"
                     }
-                    response = session.get(file_url, stream=True, timeout=10, headers=headers)  # ← CHANGED HERE (was 60)
+                    # ← CHANGED TIMEOUT HERE (file download)
+                    response = session.get(file_url, stream=True, timeout=10, headers=headers)
                     
                     if response.status_code == 200:
                         success = True
@@ -417,7 +419,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 except Exception as e:
                     logger.warning(f"Attempt {attempt+1} failed: {str(e)}")
                     if attempt < max_retries - 1:
-                        await asyncio.sleep(2 ** attempt)
+                        await asyncio.sleep(1.5 ** attempt)   # slightly faster backoff
             
             if not success:
                 skipped_files.append(file_name)
@@ -437,7 +439,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             
             try:
                 with open(final_path, "wb") as f:
-                    # Use 512KB chunks for faster download
                     for chunk in response.iter_content(chunk_size=524288):  # 512KB chunks
                         if not chunk:
                             continue
@@ -526,7 +527,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             last_update_time = [upload_start_time]
             
             try:
-                # Open file in binary mode with optimized buffering
                 with open(final_path, "rb") as f:
                     if is_video:
                         send_kwargs = {
@@ -538,7 +538,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             "progress_args": (status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         }
                         
-                        # Add optional parameters only if they're valid
                         if thumb_path and os.path.exists(thumb_path):
                             send_kwargs["thumb"] = thumb_path
                         if duration is not None and duration > 0:
@@ -568,7 +567,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         )
                 
-                # Log final upload speed
                 total_upload_time = time.time() - upload_start_time
                 file_size_mb = os.path.getsize(final_path) / 1024 / 1024
                 upload_speed_mbps = file_size_mb / total_upload_time if total_upload_time > 0 else 0
@@ -605,7 +603,6 @@ async def handle_message(client: Client, message: Message):
     if not unique_urls:
         return
     
-    # Use optimized session with connection pooling
     session = create_optimized_session()
     
     for url in unique_urls:
