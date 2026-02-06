@@ -14,6 +14,7 @@ from dump import (
     get_url_data
 )
 import requests
+import urllib3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from urllib.parse import urljoin
