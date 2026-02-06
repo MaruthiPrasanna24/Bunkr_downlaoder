@@ -17,7 +17,7 @@ import requests
 import urllib3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, urlunparse
 from bs4 import BeautifulSoup
 from pyrogram.errors import MessageNotModified
 import subprocess
@@ -64,7 +64,7 @@ def create_optimized_session():
         pool_connections=10,
         pool_maxsize=20,
         max_retries=Retry(
-            total=7,
+            total=2,
             backoff_factor=1.5,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
@@ -136,8 +136,10 @@ def fix_bunkr_url(url: str) -> str:
     url = url.replace("c.bunkr-cache.se", "c.bunkr.su")
     url = url.replace("bunkr-cache.se", "bunkr.su")
     url = url.replace("c.bunkr.is", "c.bunkr.su")
-    # Add more replacements if needed for new CDNs
-    url = url.replace("gigachad-cdn.ru", "bunkr.su")  # Example for new CDN
+    url = url.replace("gigachad-cdn.ru", "bunkr.su")
+    url = url.replace("mlk-bk.cdn.bunkr.su", "media-files.bunkr.su")
+    url = url.replace("mlk-bk.cdn.gigachad-cdn.ru", "media-files.bunkr.su")
+    # Add more if needed
     return url
 def get_video_duration_ffprobe(video_path: str) -> int:
     """Get video duration using ffprobe"""
@@ -295,22 +297,34 @@ async def generate_video_thumbnail(video_path: str, output_path: str) -> bool:
    
     logger.warning(f"[v0] No thumbnail generated for {video_path}")
     return False
-async def download_file(session, file_url, final_path, file_size, status_msg, file_name, idx, total_items):
-    """Download file with resume support, return True if successful"""
+async def download_file(session, file_url, final_path, status_msg, file_name, idx, total_items):
+    """Download file with resume support, return (success, file_size)"""
+    file_size = 0
     try:
         downloaded = os.path.getsize(final_path) if os.path.exists(final_path) else 0
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Referer": "https://bunkr.su/"
         }
-        if downloaded > 0 and file_size > 0:
+        if downloaded > 0:
             headers["Range"] = f"bytes={downloaded}-"
        
         response = session.get(file_url, stream=True, timeout=60, headers=headers)
        
         if response.status_code not in (200, 206):
             logger.warning(f"Unexpected status code {response.status_code} for {file_url}")
-            return False
+            return False, file_size
+       
+        # Get file_size from response if not known
+        content_length = int(response.headers.get("Content-Length", 0))
+        if 'Content-Range' in response.headers:
+            cr = response.headers['Content-Range']
+            if '/' in cr:
+                file_size = int(cr.split('/')[-1])
+        elif response.status_code == 200:
+            file_size = content_length
+        else:
+            file_size = downloaded + content_length
        
         mode = 'ab' if downloaded > 0 else 'wb'
        
@@ -345,18 +359,27 @@ async def download_file(session, file_url, final_path, file_size, status_msg, fi
                     last_update = current_time
        
         # Verify completion
-        if file_size > 0 and os.path.getsize(final_path) == file_size:
-            return True
+        final_size = os.path.getsize(final_path)
+        if file_size > 0:
+            if final_size == file_size:
+                return True, file_size
+            else:
+                logger.warning(f"Incomplete download for {file_name}: {final_size}/{file_size}")
+                return False, file_size
         else:
-            logger.warning(f"Incomplete download for {file_name}: {os.path.getsize(final_path)}/{file_size}")
-            return False
+            # If no size known, assume complete if downloaded something
+            if final_size > 0:
+                return True, final_size
+            else:
+                logger.warning(f"Empty download for {file_name}")
+                return False, 0
    
     except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError, urllib3.exceptions.ProtocolError) as e:
         logger.warning(f"Download interrupted for {file_name}: {str(e)} - will resume on retry")
-        return False
+        return False, file_size
     except Exception as e:
         logger.exception(f"Unexpected error in download for {file_name}: {e}")
-        return False
+        return False, file_size
 # ⚡ OPTIMIZED FILE UPLOAD WITH FASTER SPEED (7-10 MB/s target)
 async def download_and_send_file(client: Client, message: Message, url: str, session: requests.Session):
     try:
@@ -435,38 +458,44 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:30]}"
             )
            
-            # Get file size first using HEAD
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://bunkr.su/"
-            }
-            head_response = session.head(file_url, headers=headers, timeout=30)
-            file_size = int(head_response.headers.get("content-length", 0)) if head_response.status_code == 200 else 0
-            if file_size == 0:
-                logger.warning(f"Could not get file size for {file_url}")
-           
             final_path = os.path.join(download_path, file_name)
            
             success = False
-            max_retries = 5  # Increased retries for flaky CDNs
+            max_retries = 2  # As per request
+            file_size = 0
            
             for attempt in range(max_retries):
                 logger.info(f"Download attempt {attempt+1}/{max_retries} for {file_name}")
-                if await download_file(session, file_url, final_path, file_size, status_msg, file_name, idx, len(items)):
+               
+                # Try HEAD to get size
+                try:
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Referer": "https://bunkr.su/"
+                    }
+                    head_response = session.head(file_url, headers=headers, timeout=60)
+                    if head_response.status_code == 200:
+                        file_size = int(head_response.headers.get("content-length", 0))
+                    else:
+                        logger.warning(f"HEAD failed with status {head_response.status_code} for {file_url}")
+                except Exception as e:
+                    logger.warning(f"HEAD request failed for {file_name}: {str(e)}")
+               
+                dl_success, dl_size = await download_file(session, file_url, final_path, status_msg, file_name, idx, len(items))
+                if dl_success:
                     success = True
+                    file_size = dl_size if file_size == 0 else file_size
                     break
                 else:
+                    file_size = dl_size if dl_size > 0 else file_size
+                   
                     if attempt < max_retries - 1:
-                        await asyncio.sleep(2 ** attempt)  # Exponential backoff
                         if view_url:  # Refetch download URL on failure
                             logger.info(f"Refetching download URL from {view_url} for {file_name}")
                             new_item = get_real_download_url(session, view_url, True, file_name)
                             if new_item:
-                                file_url = new_item.get("url")
-                                file_url = fix_bunkr_url(file_url)
-                                # Refetch file_size
-                                head_response = session.head(file_url, headers=headers, timeout=30)
-                                file_size = int(head_response.headers.get("content-length", 0)) if head_response.status_code == 200 else 0
+                                file_url = fix_bunkr_url(new_item.get("url"))
+                        await asyncio.sleep(10)  # 10 second delay as per request
            
             if not success:
                 skipped_files.append(file_name)
