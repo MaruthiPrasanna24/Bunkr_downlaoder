@@ -38,8 +38,8 @@ BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 DOWNLOADS_DIR = os.getenv('DOWNLOADS_DIR', 'downloads')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-# List of all Bunkr domains/mirrors (for fallbacks)
-DOMAINS = ['su', 'si', 'fi', 'la', 'is', 'pk', 'sk', 'cr', 'ru', 'ph', 'ps', 'ci', 'ax', 'ac', 'black', 'media', 'red', 'site', 'ws', 'org', 'cat', 'cc', 'com', 'net', 'to']
+# List of all Bunkr domains/mirrors (for fallbacks) - expanded with more from searches
+DOMAINS = ['su', 'si', 'fi', 'la', 'is', 'pk', 'sk', 'cr', 'ru', 'ph', 'ps', 'ci', 'ax', 'ac', 'black', 'media', 'red', 'site', 'ws', 'org', 'cat', 'cc', 'com', 'net', 'to', 'es', 'it']
 # ⚡ OPTIMIZED PYROGRAM CLIENT
 app = Client(
     "bunkr_downloader_bot",
@@ -281,23 +281,51 @@ async def generate_video_thumbnail(video_path: str, output_path: str) -> bool:
    
     logger.warning(f"[v0] No thumbnail generated for {video_path}")
     return False
+def get_and_prepare_download_path(base_dir, album_name):
+    """Prepare download path by creating directory"""
+    # Sanitize album_name for file system
+    safe_name = re.sub(r'[^\w\-_\. ]', '_', album_name)
+    path = os.path.join(base_dir, safe_name)
+    os.makedirs(path, exist_ok=True)
+    return path
 def get_working_url(session, original_url):
-    """Try multiple domains to find a working URL for album/view pages"""
+    """Try original URL first with retries, then multiple domains immediately if fails"""
+    logger.info(f"[v0] Trying original domain for page: {original_url}")
+    try:
+        r = session.head(original_url, timeout=5)
+        if r.status_code in [200, 301, 302]:
+            logger.info(f"[v0] Original domain worked for page: {original_url}")
+            return original_url
+    except Exception as e:
+        logger.warning(f"[v0] Original domain failed for page: {str(e)}")
+    
+    # Immediately try other domains one by one without delay
     parsed = urlparse(original_url)
     path = parsed.path + ('?' + parsed.query if parsed.query else '')
-    for ext in DOMAINS:
+    current_ext = parsed.netloc.split('.')[-1] if '.' in parsed.netloc else ''
+    for ext in [e for e in DOMAINS if e != current_ext]:
         try_url = f"https://bunkr.{ext}{path}"
-        logger.info(f"[v0] Trying domain for page: bunkr.{ext}")
+        logger.info(f"[v0] Trying fallback domain for page: bunkr.{ext}")
         try:
             r = session.head(try_url, timeout=5)
-            if r.status_code == 200:
-                logger.info(f"[v0] Working domain found for page: bunkr.{ext}")
+            if r.status_code in [200, 301, 302]:
+                logger.info(f"[v0] Working fallback domain found for page: bunkr.{ext}")
                 return try_url
         except Exception as e:
             logger.warning(f"[v0] Domain {ext} failed for page: {str(e)}")
     return None
 def get_working_cdn_url(session, original_file_url):
-    """Try multiple domains to find a working CDN URL for files"""
+    """Try original file URL first with retries, then multiple CDN domains immediately if fails"""
+    logger.info(f"[v0] Trying original CDN for file: {original_file_url}")
+    try:
+        r = session.head(original_file_url, timeout=5)
+        if r.status_code in [200, 301, 302]:
+            logger.info(f"[v0] Original CDN worked for file: {original_file_url}")
+            return original_file_url
+    except Exception as e:
+        logger.warning(f"[v0] Original CDN failed for file: {str(e)}")
+    
+    # Immediately try other domains one by one without delay
     parsed = urlparse(original_file_url)
     path = parsed.path + ('?' + parsed.query if parsed.query else '')
     host_parts = parsed.netloc.split('.')
@@ -305,14 +333,15 @@ def get_working_cdn_url(session, original_file_url):
         prefix = host_parts[0]
     else:
         prefix = 'media'  # Default to media for files/videos
-    for ext in DOMAINS:
+    current_ext = host_parts[-1] if len(host_parts) > 1 else ''
+    for ext in [e for e in DOMAINS if e != current_ext]:
         try_host = f"{prefix}.bunkr.{ext}"
         try_url = f"https://{try_host}{path}"
-        logger.info(f"[v0] Trying CDN domain: {try_host}")
+        logger.info(f"[v0] Trying fallback CDN domain: {try_host}")
         try:
             r = session.head(try_url, timeout=5)
             if r.status_code in [200, 301, 302]:
-                logger.info(f"[v0] Working CDN domain found: {try_host}")
+                logger.info(f"[v0] Working fallback CDN domain found: {try_host}")
                 return try_url
         except Exception as e:
             logger.warning(f"[v0] CDN domain {ext} failed: {str(e)}")
@@ -365,7 +394,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         if is_bunkr and not url.startswith("https"):
             url = f"https://bunkr.su{url}"  # Fallback default, but will try others
        
-        # Get working album URL with fallback
+        # Get working album URL with fallback (tries original first)
         working_url = get_working_url(session, url)
         if not working_url:
             await safe_edit(status_msg, "❌ No working domain found for album")
@@ -401,7 +430,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 if box:
                     view_url = urljoin(url, box["href"])
                     name = theItem.find("p").text if theItem.find("p") else "file"
-                    # Get working view URL
+                    # Get working view URL (tries original view_url first)
                     working_view_url = get_working_url(session, view_url)
                     if not working_view_url:
                         continue
@@ -413,7 +442,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             await safe_edit(status_msg, "❌ No downloadable items found")
             return
        
-        download_path = get_and_prepare_download_path(DOWNLOADS_DIR, album_name)  # Assuming from dump
+        download_path = get_and_prepare_download_path(DOWNLOADS_DIR, album_name)
         await safe_edit(status_msg, f"📥 Found {len(items)} items. Starting...")
        
         skipped_files = []
@@ -433,7 +462,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
            
             seen_urls.add(file_url)
            
-            # Get working CDN/file URL with fallback
+            # Get working CDN/file URL with fallback (tries original first)
             working_file_url = get_working_cdn_url(session, file_url)
             if not working_file_url:
                 skipped_files.append(file_name)
@@ -455,7 +484,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                         "Referer": "https://bunkr.su/"
                     }
-                    response = session.get(file_url, stream=True, timeout=(10, 60), headers=headers)  # 10sec connect, 60sec read
+                    response = session.get(file_url, stream=True, timeout=(5, 60), headers=headers)  # 5sec connect, 60sec read
                    
                     if response.status_code == 200:
                         success = True
