@@ -6,40 +6,52 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from dotenv import load_dotenv
 import logging
+from dump import (
+    get_items_list,
+    create_session,
+    get_and_prepare_download_path,
+    get_real_download_url,
+    get_url_data
+)
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from pyrogram.errors import MessageNotModified
 import subprocess
 import json
 from concurrent.futures import ThreadPoolExecutor
 import threading
+
 try:
     from moviepy.editor import VideoFileClip
     MOVIEPY_AVAILABLE = True
 except ImportError:
     MOVIEPY_AVAILABLE = False
+
 try:
     import cv2
     OPENCV_AVAILABLE = True
 except ImportError:
     OPENCV_AVAILABLE = False
+
 try:
     from PIL import Image, ImageDraw, ImageFont
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
+
 load_dotenv()
+
 API_ID = int(os.getenv('TELEGRAM_API_ID'))
 API_HASH = os.getenv('TELEGRAM_API_HASH')
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 DOWNLOADS_DIR = os.getenv('DOWNLOADS_DIR', 'downloads')
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-# List of all Bunkr domains/mirrors (for fallbacks) - expanded with more from searches
-DOMAINS = ['su', 'si', 'fi', 'la', 'is', 'pk', 'sk', 'cr', 'ru', 'ph', 'ps', 'ci', 'ax', 'ac', 'black', 'media', 'red', 'site', 'ws', 'org', 'cat', 'cc', 'com', 'net', 'to', 'es', 'it']
+
 # ⚡ OPTIMIZED PYROGRAM CLIENT
 app = Client(
     "bunkr_downloader_bot",
@@ -48,37 +60,42 @@ app = Client(
     bot_token=BOT_TOKEN,
     workdir=".",
 )
-# Enhanced session with connection pooling (reduced retries)
+
+# Enhanced session with connection pooling
 def create_optimized_session():
     """Create session with optimized connection pooling"""
     session = requests.Session()
-   
+    
     # Connection pooling with increased pool size
     adapter = HTTPAdapter(
         pool_connections=10,
         pool_maxsize=20,
         max_retries=Retry(
-            total=2,  # Reduced to 2 as requested
-            backoff_factor=1,
+            total=7,
+            backoff_factor=1.5,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
         )
     )
-   
+    
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
+
 URL_PATTERN = r'(https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|net|to)|bunkrrr\.org|cyberdrop\.(?:me|cr|to|cc|nl))[^\s]+)'
+
 def extract_urls(text):
     matches = re.findall(URL_PATTERN, text)
     logger.info(f"[v0] URL_PATTERN matches: {matches}")
     return matches
+
 def is_valid_bunkr_url(url):
     is_valid = bool(
         re.match(r'https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|net|to)|bunkrrr\.org|cyberdrop\.(?:me|cr|to|cc|nl))', url)
     )
     logger.info(f"[v0] is_valid_bunkr_url({url}) = {is_valid}")
     return is_valid
+
 async def safe_edit(msg, text):
     """Safely edit Telegram message without crashing"""
     try:
@@ -88,6 +105,7 @@ async def safe_edit(msg, text):
         pass
     except Exception as e:
         logger.warning(f"[v0] edit_text failed: {e}")
+
 def human_bytes(size):
     if size < 1024:
         return f"{size} B"
@@ -97,34 +115,43 @@ def human_bytes(size):
         return f"{size / 1024**2:.2f} MB"
     else:
         return f"{size / 1024**3:.2f} GB"
+
 # ⚡ OPTIMIZED UPLOAD PROGRESS WITH SPEED TRACKING
 async def optimized_upload_progress(current, total, status_msg, file_name, idx, total_items, last_update_time, start_time):
     if total == 0:
         return
-   
+    
     current_time = time.time()
-    if current_time - last_update_time[0] < 3: # Update every 3 seconds for better speed display
+    if current_time - last_update_time[0] < 3:  # Update every 3 seconds for better speed display
         return
-   
+    
     last_update_time[0] = current_time
     percent = int(current * 100 / total)
     elapsed = current_time - start_time
     speed = current / elapsed if elapsed > 0 else 0
     eta = (total - current) / speed if speed > 0 else 0
-   
+    
     bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
-   
+    
     # Show speed in MB/s
     speed_mbps = (speed / 1024 / 1024)
-   
+    
     text = (
         f"📤 Uploading [{idx}/{total_items}]: {file_name[:25]}...\n"
         f"[{bar}] {percent}%\n"
         f"{human_bytes(current)} / {human_bytes(total)}\n"
         f"⚡ Speed: {speed_mbps:.2f} MB/s | ETA: {int(eta // 60)}m {int(eta % 60)}s"
     )
-   
+    
     await safe_edit(status_msg, text)
+
+def fix_bunkr_url(url: str) -> str:
+    """Fix unstable Bunkr CDN domains"""
+    url = url.replace("c.bunkr-cache.se", "c.bunkr.su")
+    url = url.replace("bunkr-cache.se", "bunkr.su")
+    url = url.replace("c.bunkr.is", "c.bunkr.su")
+    return url
+
 def get_video_duration_ffprobe(video_path: str) -> int:
     """Get video duration using ffprobe"""
     try:
@@ -141,16 +168,17 @@ def get_video_duration_ffprobe(video_path: str) -> int:
     except Exception as e:
         logger.warning(f"[v0] ffprobe duration failed: {e}")
     return None
+
 def get_video_duration(video_path: str) -> int:
     """Returns video duration in seconds"""
     if not os.path.exists(video_path):
         logger.warning(f"[v0] Video file not found: {video_path}")
         return None
-   
+    
     duration = get_video_duration_ffprobe(video_path)
     if duration is not None and duration > 0:
         return duration
-   
+    
     if MOVIEPY_AVAILABLE:
         try:
             clip = VideoFileClip(video_path)
@@ -161,7 +189,7 @@ def get_video_duration(video_path: str) -> int:
                 return duration
         except Exception as e:
             logger.warning(f"[v0] MoviePy duration failed: {e}")
-   
+    
     if OPENCV_AVAILABLE:
         try:
             cap = cv2.VideoCapture(video_path)
@@ -176,8 +204,9 @@ def get_video_duration(video_path: str) -> int:
                         return duration
         except Exception as e:
             logger.warning(f"[v0] OpenCV duration failed: {e}")
-   
+    
     return None
+
 def get_video_resolution_ffprobe(video_path: str) -> tuple:
     """Get video resolution using ffprobe"""
     try:
@@ -196,6 +225,7 @@ def get_video_resolution_ffprobe(video_path: str) -> tuple:
     except Exception as e:
         logger.warning(f"[v0] ffprobe resolution failed: {e}")
     return (None, None)
+
 async def generate_video_thumbnail_ffmpeg(video_path: str, output_path: str) -> bool:
     """Generate thumbnail using ffmpeg"""
     try:
@@ -210,6 +240,7 @@ async def generate_video_thumbnail_ffmpeg(video_path: str, output_path: str) -> 
     except Exception as e:
         logger.warning(f"[v0] ffmpeg thumbnail failed: {e}")
     return False
+
 async def generate_video_thumbnail_moviepy(video_path: str, output_path: str) -> bool:
     """Generate thumbnail using moviepy"""
     try:
@@ -224,6 +255,7 @@ async def generate_video_thumbnail_moviepy(video_path: str, output_path: str) ->
     except Exception as e:
         logger.warning(f"[v0] MoviePy thumbnail failed: {e}")
     return False
+
 async def generate_video_thumbnail_opencv(video_path: str, output_path: str) -> bool:
     """Generate thumbnail using opencv"""
     try:
@@ -242,6 +274,7 @@ async def generate_video_thumbnail_opencv(video_path: str, output_path: str) -> 
     except Exception as e:
         logger.warning(f"[v0] OpenCV thumbnail failed: {e}")
     return False
+
 async def generate_fallback_thumbnail(video_path: str, output_path: str) -> bool:
     """Generate a simple fallback thumbnail"""
     try:
@@ -264,12 +297,13 @@ async def generate_fallback_thumbnail(video_path: str, output_path: str) -> bool
     except Exception as e:
         logger.warning(f"[v0] Fallback thumbnail failed: {e}")
     return False
+
 async def generate_video_thumbnail(video_path: str, output_path: str) -> bool:
     """Generate thumbnail using ffmpeg, moviepy, opencv, or fallback"""
     if not os.path.exists(video_path):
         logger.warning(f"[v0] Video file not found for thumbnail: {video_path}")
         return False
-   
+    
     if await generate_video_thumbnail_ffmpeg(video_path, output_path):
         return True
     if MOVIEPY_AVAILABLE and await generate_video_thumbnail_moviepy(video_path, output_path):
@@ -278,148 +312,44 @@ async def generate_video_thumbnail(video_path: str, output_path: str) -> bool:
         return True
     if await generate_fallback_thumbnail(video_path, output_path):
         return True
-   
+    
     logger.warning(f"[v0] No thumbnail generated for {video_path}")
     return False
-def get_and_prepare_download_path(base_dir, album_name):
-    """Prepare download path by creating directory"""
-    # Sanitize album_name for file system
-    safe_name = re.sub(r'[^\w\-_\. ]', '_', album_name)
-    path = os.path.join(base_dir, safe_name)
-    os.makedirs(path, exist_ok=True)
-    return path
-def get_working_url(session, original_url):
-    """Try original URL first with retries, then multiple domains immediately if fails"""
-    logger.info(f"[v0] Trying original domain for page: {original_url}")
-    try:
-        r = session.head(original_url, timeout=5)
-        if r.status_code in [200, 301, 302]:
-            logger.info(f"[v0] Original domain worked for page: {original_url}")
-            return original_url
-    except Exception as e:
-        logger.warning(f"[v0] Original domain failed for page: {str(e)}")
-    
-    # Immediately try other domains one by one without delay
-    parsed = urlparse(original_url)
-    path = parsed.path + ('?' + parsed.query if parsed.query else '')
-    current_ext = parsed.netloc.split('.')[-1] if '.' in parsed.netloc else ''
-    for ext in [e for e in DOMAINS if e != current_ext]:
-        try_url = f"https://bunkr.{ext}{path}"
-        logger.info(f"[v0] Trying fallback domain for page: bunkr.{ext}")
-        try:
-            r = session.head(try_url, timeout=5)
-            if r.status_code in [200, 301, 302]:
-                logger.info(f"[v0] Working fallback domain found for page: bunkr.{ext}")
-                return try_url
-        except Exception as e:
-            logger.warning(f"[v0] Domain {ext} failed for page: {str(e)}")
-    return None
-def get_working_cdn_url(session, original_file_url):
-    """Try original file URL first with retries, then multiple CDN domains immediately if fails"""
-    logger.info(f"[v0] Trying original CDN for file: {original_file_url}")
-    try:
-        r = session.head(original_file_url, timeout=5)
-        if r.status_code in [200, 301, 302]:
-            logger.info(f"[v0] Original CDN worked for file: {original_file_url}")
-            return original_file_url
-    except Exception as e:
-        logger.warning(f"[v0] Original CDN failed for file: {str(e)}")
-    
-    # Immediately try other domains one by one without delay
-    parsed = urlparse(original_file_url)
-    path = parsed.path + ('?' + parsed.query if parsed.query else '')
-    host_parts = parsed.netloc.split('.')
-    if host_parts[0] in ['c', 'media', 'stream', 'cdn', 'i']:
-        prefix = host_parts[0]
-    else:
-        prefix = 'media'  # Default to media for files/videos
-    current_ext = host_parts[-1] if len(host_parts) > 1 else ''
-    for ext in [e for e in DOMAINS if e != current_ext]:
-        try_host = f"{prefix}.bunkr.{ext}"
-        try_url = f"https://{try_host}{path}"
-        logger.info(f"[v0] Trying fallback CDN domain: {try_host}")
-        try:
-            r = session.head(try_url, timeout=5)
-            if r.status_code in [200, 301, 302]:
-                logger.info(f"[v0] Working fallback CDN domain found: {try_host}")
-                return try_url
-        except Exception as e:
-            logger.warning(f"[v0] CDN domain {ext} failed: {str(e)}")
-    return None
-def my_get_real_download_url(session, page_url, is_direct, name):
-    """Replacement for get_real_download_url with domain fallback and scraping"""
-    working_page_url = get_working_url(session, page_url)
-    if not working_page_url:
-        logger.warning(f"[v0] No working domain for {page_url}")
-        return None
-    try:
-        r = session.get(working_page_url, timeout=10)
-        if r.status_code != 200:
-            return None
-        soup = BeautifulSoup(r.content, 'html.parser')
-        direct_url = None
-        # Scrape based on Bunkr HTML structure
-        video = soup.find('video')
-        if video:
-            source = video.find('source')
-            if source:
-                direct_url = source['src']
-        else:
-            img = soup.find('img', {'id': 'img-viewer'}) or soup.find('img', alt='image')
-            if img:
-                direct_url = img['src']
-            else:
-                download_btn = soup.find('a', string=re.compile('download', re.I)) or soup.find('a', {'class': 'btn-download'})
-                if download_btn:
-                    direct_url = urljoin(working_page_url, download_btn['href'])
-        if not direct_url:
-            logger.warning(f"[v0] No direct URL found in {working_page_url}")
-            return None
-        return {'url': direct_url, 'name': name}
-    except Exception as e:
-        logger.warning(f"[v0] Failed to scrape direct URL: {str(e)}")
-        return None
+
 # ⚡ OPTIMIZED FILE UPLOAD WITH FASTER SPEED (7-10 MB/s target)
 async def download_and_send_file(client: Client, message: Message, url: str, session: requests.Session):
     try:
         logger.info(f"[v0] Starting download_and_send_file for: {url}")
         status_msg = await message.reply_text(f"🔄 Processing: {url[:50]}...")
         last_status = ""
-       
+        
         is_bunkr = "bunkr" in url or "bunkrrr" in url
         logger.info(f"[v0] is_bunkr: {is_bunkr}")
-       
-        # No hard replacements - fallback handles it
-       
+        
+        url = url.replace("bunkr.pk", "bunkr.su").replace("bunkr.is", "bunkr.su")
+        
         if is_bunkr and not url.startswith("https"):
-            url = f"https://bunkr.su{url}"  # Fallback default, but will try others
-       
-        # Get working album URL with fallback (tries original first)
-        working_url = get_working_url(session, url)
-        if not working_url:
-            await safe_edit(status_msg, "❌ No working domain found for album")
-            return
-        url = working_url
-       
-        r = session.get(url, timeout=10)
-       
+            url = f"https://bunkr.su{url}"
+        
+        r = session.get(url, timeout=30)
+        
         if r.status_code != 200:
             await safe_edit(status_msg, f"❌ HTTP {r.status_code} on album page")
             return
-       
+        
         soup = BeautifulSoup(r.content, 'html.parser')
-       
+        
         is_direct = (
             soup.find('span', {'class': 'ic-videos'}) is not None or
             soup.find('div', {'class': 'lightgallery'}) is not None
         )
-       
+        
         items = []
-       
+        
         if is_direct:
             h1 = soup.find('h1', {'class': 'text-[20px]'}) or soup.find('h1', {'class': 'truncate'})
             album_name = h1.text if h1 else "file"
-            item = my_get_real_download_url(session, url, True, album_name)
+            item = get_real_download_url(session, url, True, album_name)
             if item:
                 items.append(item)
         else:
@@ -430,24 +360,20 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 if box:
                     view_url = urljoin(url, box["href"])
                     name = theItem.find("p").text if theItem.find("p") else "file"
-                    # Get working view URL (tries original view_url first)
-                    working_view_url = get_working_url(session, view_url)
-                    if not working_view_url:
-                        continue
-                    direct_item = my_get_real_download_url(session, working_view_url, True, name)
+                    direct_item = get_real_download_url(session, view_url, True, name)
                     if direct_item:
                         items.append(direct_item)
-       
+        
         if not items:
             await safe_edit(status_msg, "❌ No downloadable items found")
             return
-       
+        
         download_path = get_and_prepare_download_path(DOWNLOADS_DIR, album_name)
         await safe_edit(status_msg, f"📥 Found {len(items)} items. Starting...")
-       
+        
         skipped_files = []
         seen_urls = set()
-       
+        
         for idx, item in enumerate(items, 1):
             if isinstance(item, dict):
                 file_url = item.get("url")
@@ -455,37 +381,30 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             else:
                 file_url = item
                 file_name = album_name
-           
+            
             if file_url in seen_urls:
                 logger.info(f"Skipping duplicate file_url: {file_url}")
                 continue
-           
+            
             seen_urls.add(file_url)
-           
-            # Get working CDN/file URL with fallback (tries original first)
-            working_file_url = get_working_cdn_url(session, file_url)
-            if not working_file_url:
-                skipped_files.append(file_name)
-                await safe_edit(status_msg, f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (no working CDN)")
-                continue
-            file_url = working_file_url
-           
+            file_url = fix_bunkr_url(file_url)
+            
             await safe_edit(
                 status_msg,
                 f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:30]}"
             )
-           
+            
             success = False
-            max_retries = 2  # Reduced to 2 as requested
-           
+            max_retries = 4
+            
             for attempt in range(max_retries):
                 try:
                     headers = {
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                         "Referer": "https://bunkr.su/"
                     }
-                    response = session.get(file_url, stream=True, timeout=(5, 60), headers=headers)  # 5sec connect, 60sec read
-                   
+                    response = session.get(file_url, stream=True, timeout=60, headers=headers)
+                    
                     if response.status_code == 200:
                         success = True
                         break
@@ -494,12 +413,12 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         break
                     else:
                         logger.warning(f"HTTP {response.status_code} on attempt {attempt+1}")
-               
+                
                 except Exception as e:
                     logger.warning(f"Attempt {attempt+1} failed: {str(e)}")
                     if attempt < max_retries - 1:
                         await asyncio.sleep(2 ** attempt)
-           
+            
             if not success:
                 skipped_files.append(file_name)
                 await safe_edit(
@@ -508,45 +427,45 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 )
                 logger.error(f"Skipped file: {file_name}")
                 continue
-           
+            
             # ⚡ OPTIMIZED DOWNLOAD WITH LARGER CHUNKS
             file_size = int(response.headers.get("content-length", 0))
             final_path = os.path.join(download_path, file_name)
             downloaded = 0
             start_time = time.time()
             last_update = start_time
-           
+            
             try:
                 with open(final_path, "wb") as f:
                     # Use 512KB chunks for faster download
-                    for chunk in response.iter_content(chunk_size=524288): # 512KB chunks
+                    for chunk in response.iter_content(chunk_size=524288):  # 512KB chunks
                         if not chunk:
                             continue
                         f.write(chunk)
                         downloaded += len(chunk)
                         current_time = time.time()
-                       
+                        
                         if current_time - last_update >= 5 and file_size > 0:
                             percent = int((downloaded / file_size) * 100)
                             elapsed = current_time - start_time
                             speed = downloaded / elapsed if elapsed > 0 else 0
                             eta = (file_size - downloaded) / speed if speed > 0 else 0
-                           
+                            
                             bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
                             speed_mbps = speed / 1024 / 1024
-                           
+                            
                             text = (
                                 f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:25]}\n"
                                 f"[{bar}] {percent}%\n"
                                 f"{human_bytes(downloaded)} / {human_bytes(file_size)}\n"
                                 f"⚡ Speed: {speed_mbps:.2f} MB/s | ETA: {int(eta // 60)}m {int(eta % 60)}s"
                             )
-                           
+                            
                             if text != last_status:
                                 await safe_edit(status_msg, text)
                                 last_status = text
                             last_update = current_time
-           
+            
             except Exception as download_err:
                 skipped_files.append(file_name)
                 await safe_edit(
@@ -557,18 +476,18 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 if os.path.exists(final_path):
                     os.remove(final_path)
                 continue
-           
+            
             # Video metadata extraction
             duration = None
             width = None
             height = None
             is_video = file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm'))
-           
+            
             if is_video:
                 logger.info(f"[v0] Getting video metadata for {file_name}")
                 duration = get_video_duration(final_path)
                 width, height = get_video_resolution_ffprobe(final_path)
-               
+                
                 if width is None and MOVIEPY_AVAILABLE:
                     try:
                         clip = VideoFileClip(final_path)
@@ -576,7 +495,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         clip.close()
                     except Exception as e:
                         logger.warning(f"[v0] MoviePy resolution failed: {e}")
-               
+                
                 if width is None and OPENCV_AVAILABLE:
                     try:
                         cap = cv2.VideoCapture(final_path)
@@ -586,7 +505,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             cap.release()
                     except Exception as e:
                         logger.warning(f"[v0] OpenCV resolution failed: {e}")
-           
+            
             # Thumbnail generation
             thumb_path = None
             if is_video:
@@ -596,16 +515,16 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 success_thumb = await generate_video_thumbnail(final_path, thumb_path)
                 if not success_thumb or not os.path.exists(thumb_path):
                     thumb_path = None
-           
+            
             # ⚡ OPTIMIZED UPLOAD TO TELEGRAM WITH FASTER SPEED
             await safe_edit(
                 status_msg,
                 f"📤 Uploading [{idx}/{len(items)}]: {file_name[:30]}"
             )
-           
+            
             upload_start_time = time.time()
             last_update_time = [upload_start_time]
-           
+            
             try:
                 # Open file in binary mode with optimized buffering
                 with open(final_path, "rb") as f:
@@ -618,7 +537,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             "progress": optimized_upload_progress,
                             "progress_args": (status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         }
-                       
+                        
                         # Add optional parameters only if they're valid
                         if thumb_path and os.path.exists(thumb_path):
                             send_kwargs["thumb"] = thumb_path
@@ -628,9 +547,9 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             send_kwargs["width"] = width
                         if height is not None and height > 0:
                             send_kwargs["height"] = height
-                       
+                        
                         await client.send_video(**send_kwargs)
-                   
+                    
                     elif file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
                         await client.send_photo(
                             message.chat.id,
@@ -639,7 +558,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             progress=optimized_upload_progress,
                             progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         )
-                   
+                    
                     else:
                         await client.send_document(
                             message.chat.id,
@@ -648,49 +567,51 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             progress=optimized_upload_progress,
                             progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         )
-               
+                
                 # Log final upload speed
                 total_upload_time = time.time() - upload_start_time
                 file_size_mb = os.path.getsize(final_path) / 1024 / 1024
                 upload_speed_mbps = file_size_mb / total_upload_time if total_upload_time > 0 else 0
                 logger.info(f"[v0] Upload complete for {file_name}: {upload_speed_mbps:.2f} MB/s")
-           
+            
             except Exception as upload_err:
                 logger.exception(f"Upload failed for {file_name}: {upload_err}")
                 await safe_edit(status_msg, f"⚠️ Upload failed for {file_name[:30]}")
-           
+            
             # Cleanup
             if os.path.exists(final_path):
                 os.remove(final_path)
             if thumb_path and os.path.exists(thumb_path):
                 os.remove(thumb_path)
-       
+        
         # Final summary
         summary = f"✅ Done! {album_name}\n"
         if skipped_files:
             summary += f"⚠️ Skipped {len(skipped_files)} file(s): {', '.join(skipped_files[:3])}"
             if len(skipped_files) > 3:
                 summary += f" + {len(skipped_files)-3} more"
-       
+        
         await safe_edit(status_msg, summary)
-   
+    
     except Exception as e:
         logger.exception(e)
         await message.reply_text(f"❌ Critical error (album aborted): {str(e)[:100]}")
+
 @app.on_message(filters.text & (filters.private | filters.group))
 async def handle_message(client: Client, message: Message):
     urls = extract_urls(message.text)
     unique_urls = list(set(urls))
-   
+    
     if not unique_urls:
         return
-   
+    
     # Use optimized session with connection pooling
     session = create_optimized_session()
-   
+    
     for url in unique_urls:
         if is_valid_bunkr_url(url):
             await download_and_send_file(client, message, url, session)
+
 @app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
     await message.reply_text(
@@ -699,6 +620,7 @@ async def start_command(client: Client, message: Message):
         "The bot will download & upload automatically.\n\n"
         "⚡ **Optimized for 7-10 MB/s upload speeds**"
     )
+
 @app.on_message(filters.command("help"))
 async def help_command(client: Client, message: Message):
     await message.reply_text(
