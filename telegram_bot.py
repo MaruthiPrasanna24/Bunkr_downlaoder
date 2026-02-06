@@ -316,6 +316,69 @@ async def generate_video_thumbnail(video_path: str, output_path: str) -> bool:
     logger.warning(f"[v0] No thumbnail generated for {video_path}")
     return False
 
+async def download_file(session, file_url, final_path, file_size, status_msg, file_name, idx, total_items):
+    """Download file with resume support, return True if successful"""
+    try:
+        downloaded = os.path.getsize(final_path) if os.path.exists(final_path) else 0
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://bunkr.su/"
+        }
+        if downloaded > 0 and file_size > 0:
+            headers["Range"] = f"bytes={downloaded}-"
+        
+        response = session.get(file_url, stream=True, timeout=60, headers=headers)
+        
+        if response.status_code not in (200, 206):
+            logger.warning(f"Unexpected status code {response.status_code} for {file_url}")
+            return False
+        
+        mode = 'ab' if downloaded > 0 else 'wb'
+        
+        start_time = time.time()
+        last_update = start_time
+        
+        with open(final_path, mode) as f:
+            for chunk in response.iter_content(chunk_size=524288):  # 512KB chunks
+                if not chunk:
+                    continue
+                f.write(chunk)
+                downloaded += len(chunk)
+                current_time = time.time()
+                
+                if current_time - last_update >= 5 and file_size > 0:
+                    percent = int((downloaded / file_size) * 100)
+                    elapsed = current_time - start_time
+                    speed = downloaded / elapsed if elapsed > 0 else 0
+                    eta = (file_size - downloaded) / speed if speed > 0 else 0
+                    
+                    bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
+                    speed_mbps = speed / 1024 / 1024
+                    
+                    text = (
+                        f"⬇️ Downloading [{idx}/{total_items}]: {file_name[:25]}\n"
+                        f"[{bar}] {percent}%\n"
+                        f"{human_bytes(downloaded)} / {human_bytes(file_size)}\n"
+                        f"⚡ Speed: {speed_mbps:.2f} MB/s | ETA: {int(eta // 60)}m {int(eta % 60)}s"
+                    )
+                    
+                    await safe_edit(status_msg, text)
+                    last_update = current_time
+        
+        # Verify completion
+        if file_size > 0 and os.path.getsize(final_path) == file_size:
+            return True
+        else:
+            logger.warning(f"Incomplete download for {file_name}: {os.path.getsize(final_path)}/{file_size}")
+            return False
+    
+    except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError, urllib3.exceptions.ProtocolError) as e:
+        logger.warning(f"Download interrupted for {file_name}: {str(e)} - will resume on retry")
+        return False
+    except Exception as e:
+        logger.exception(f"Unexpected error in download for {file_name}: {e}")
+        return False
+
 # ⚡ OPTIMIZED FILE UPLOAD WITH FASTER SPEED (7-10 MB/s target)
 async def download_and_send_file(client: Client, message: Message, url: str, session: requests.Session):
     try:
@@ -394,30 +457,29 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:30]}"
             )
             
+            # Get file size first using HEAD
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://bunkr.su/"
+            }
+            head_response = session.head(file_url, headers=headers, timeout=30)
+            file_size = int(head_response.headers.get("content-length", 0))
+            if file_size == 0:
+                logger.warning(f"Could not get file size for {file_url}")
+            
+            final_path = os.path.join(download_path, file_name)
+            
             success = False
-            max_retries = 4
+            max_retries = 2  # Reduced to 2 as per request
             
             for attempt in range(max_retries):
-                try:
-                    headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        "Referer": "https://bunkr.su/"
-                    }
-                    response = session.get(file_url, stream=True, timeout=60, headers=headers)
-                    
-                    if response.status_code == 200:
-                        success = True
-                        break
-                    elif response.status_code == 404:
-                        logger.warning(f"HTTP 404 for {file_url} on attempt {attempt+1}")
-                        break
-                    else:
-                        logger.warning(f"HTTP {response.status_code} on attempt {attempt+1}")
-                
-                except Exception as e:
-                    logger.warning(f"Attempt {attempt+1} failed: {str(e)}")
+                logger.info(f"Download attempt {attempt+1}/{max_retries} for {file_name}")
+                if await download_file(session, file_url, final_path, file_size, status_msg, file_name, idx, len(items)):
+                    success = True
+                    break
+                else:
                     if attempt < max_retries - 1:
-                        await asyncio.sleep(2 ** attempt)
+                        await asyncio.sleep(2 ** attempt)  # Exponential backoff
             
             if not success:
                 skipped_files.append(file_name)
@@ -425,56 +487,9 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                     status_msg,
                     f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (failed after retries)"
                 )
-                logger.error(f"Skipped file: {file_name}")
-                continue
-            
-            # ⚡ OPTIMIZED DOWNLOAD WITH LARGER CHUNKS
-            file_size = int(response.headers.get("content-length", 0))
-            final_path = os.path.join(download_path, file_name)
-            downloaded = 0
-            start_time = time.time()
-            last_update = start_time
-            
-            try:
-                with open(final_path, "wb") as f:
-                    # Use 512KB chunks for faster download
-                    for chunk in response.iter_content(chunk_size=524288):  # 512KB chunks
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        current_time = time.time()
-                        
-                        if current_time - last_update >= 5 and file_size > 0:
-                            percent = int((downloaded / file_size) * 100)
-                            elapsed = current_time - start_time
-                            speed = downloaded / elapsed if elapsed > 0 else 0
-                            eta = (file_size - downloaded) / speed if speed > 0 else 0
-                            
-                            bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
-                            speed_mbps = speed / 1024 / 1024
-                            
-                            text = (
-                                f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:25]}\n"
-                                f"[{bar}] {percent}%\n"
-                                f"{human_bytes(downloaded)} / {human_bytes(file_size)}\n"
-                                f"⚡ Speed: {speed_mbps:.2f} MB/s | ETA: {int(eta // 60)}m {int(eta % 60)}s"
-                            )
-                            
-                            if text != last_status:
-                                await safe_edit(status_msg, text)
-                                last_status = text
-                            last_update = current_time
-            
-            except Exception as download_err:
-                skipped_files.append(file_name)
-                await safe_edit(
-                    status_msg,
-                    f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (download error)"
-                )
-                logger.exception(f"Download failed for {file_name}: {download_err}")
+                logger.error(f"Failed to download {file_name} after {max_retries} attempts")
                 if os.path.exists(final_path):
-                    os.remove(final_path)
+                    os.remove(final_path)  # Clean up partial file on final failure
                 continue
             
             # Video metadata extraction
