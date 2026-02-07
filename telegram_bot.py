@@ -53,27 +53,19 @@ app = Client(
     bot_token=BOT_TOKEN,
     workdir=".",
 )
-# Bunkr domain fallbacks (expanded with more from search)
-DOMAINS = ['la', 'su', 'is', 'ru', 'pk', 'sk', 'ph', 'ps', 'ci', 'ax', 'fi', 'ac', 'ws', 'red', 'site', 'black', 'cat', 'cc', 'org', 'cr', 'si', 'media', 'to', 'net', 'com', 'fi', 'albums.io']
-# Known CDN prefixes (expanded)
-CDN_PREFIXES = (
-    [f'cdn{i}.' for i in range(1, 13)] +
-    [f'media-files{i}.' for i in range(1, 10)] +
-    [f'i{i}.' for i in range(1, 10)] +
-    ['stream.', 'files.', 'c.', 'cdn.', 'media-files.', 'scdn.', 'c2wi.scdn.', '']
-)
-# Enhanced session with connection pooling and disable SSL verify for weak certs
+# Bunkr domain fallbacks (prioritized based on common stability, expanded with more active ones)
+DOMAINS = ['la', 'su', 'is', 'ru', 'pk', 'sk', 'ph', 'ps', 'ci', 'ax', 'fi', 'ac']
+# Enhanced session with connection pooling
 def create_optimized_session():
     """Create session with optimized connection pooling"""
     session = requests.Session()
-    session.verify = False  # Disable SSL verification for sites with weak certs
    
     # Connection pooling with increased pool size
     adapter = HTTPAdapter(
         pool_connections=10,
         pool_maxsize=20,
         max_retries=Retry(
-            total=3,
+            total=2,  # Original + 2 retries = 3 attempts
             backoff_factor=0.3,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
@@ -83,14 +75,14 @@ def create_optimized_session():
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
-URL_PATTERN = r'(https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|net|to)|bunkrrr\.org|bunkr-albums\.io|cyberdrop\.(?:me|cr|to|cc|nl))[^\s]+)'
+URL_PATTERN = r'(https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|net|to)|bunkrrr\.org|cyberdrop\.(?:me|cr|to|cc|nl))[^\s]+)'
 def extract_urls(text):
     matches = re.findall(URL_PATTERN, text)
     logger.info(f"[v0] URL_PATTERN matches: {matches}")
     return matches
 def is_valid_bunkr_url(url):
     is_valid = bool(
-        re.match(r'https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|net|to)|bunkrrr\.org|bunkr-albums\.io|cyberdrop\.(?:me|cr|to|cc|nl))', url)
+        re.match(r'https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|net|to)|bunkrrr\.org|cyberdrop\.(?:me|cr|to|cc|nl))', url)
     )
     logger.info(f"[v0] is_valid_bunkr_url({url}) = {is_valid}")
     return is_valid
@@ -309,7 +301,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         status_msg = await message.reply_text(f"🔄 Processing: {url[:50]}...")
         last_status = ""
        
-        is_bunkr = "bunkr" in url or "bunkrrr" in url or "bunkr-albums" in url
+        is_bunkr = "bunkr" in url or "bunkrrr" in url
         logger.info(f"[v0] is_bunkr: {is_bunkr}")
        
         if is_bunkr and not url.startswith("https"):
@@ -325,13 +317,10 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         r = None
         soup = None
         for tld in DOMAINS:
-            if tld == 'albums.io':
-                current_url = f"https://bunkr-albums.io{path}"
-            else:
-                current_url = f"https://bunkr.{tld}{path}"
-            logger.info(f"[v0] Trying domain for album: {urlparse(current_url).netloc}")
+            current_url = f"https://bunkr.{tld}{path}"
+            logger.info(f"[v0] Trying domain for album: bunkr.{tld}")
             try:
-                r = session.get(current_url, timeout=15)
+                r = session.get(current_url, timeout=10)
                 if r.status_code == 200:
                     soup = BeautifulSoup(r.content, 'html.parser')
                     url = current_url  # Update for urljoin
@@ -395,7 +384,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
            
             seen_urls.add(file_url)
             file_url = fix_bunkr_url(file_url)
-            logger.info(f"[v0] Original file URL: {file_url}")
            
             await safe_edit(
                 status_msg,
@@ -409,93 +397,32 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             if file_parsed.query:
                 file_path += '?' + file_parsed.query
             
-            # Extract original prefix
-            parts = file_parsed.netloc.split('.')
-            if len(parts) > 1:
-                # Always replace the last part as tld
-                original_tld = parts[-1]
-                original_prefix = '.'.join(parts[:-1]) + '.'
-            else:
-                original_prefix = ''
-                original_tld = ''
-            
-            # Prioritize original, then others
-            prefixes = [original_prefix] + [p for p in CDN_PREFIXES if p != original_prefix]
-            
-            final_path = os.path.join(download_path, file_name)
-            temp_path = os.path.join(download_path, f"temp_{file_name}")
-            
-            for prefix in prefixes:
-                for tld in DOMAINS:
-                    if tld == 'albums.io':
-                        new_netloc = prefix + 'bunkr-albums.io'
-                    else:
-                        new_netloc = prefix + 'bunkr.' + tld
+            for tld in DOMAINS:
+                parts = file_parsed.netloc.split('.')
+                if len(parts) >= 2 and parts[-2] == 'bunkr':
+                    parts[-1] = tld
+                    new_netloc = '.'.join(parts)
                     current_file_url = file_parsed._replace(netloc=new_netloc).geturl()
                     current_file_url = fix_bunkr_url(current_file_url)
                     logger.info(f"[v0] Trying domain for file: {new_netloc}")
                     try:
                         headers = {
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-                            "Referer": "https://bunkr." + tld + "/",
-                            "Accept": "*/*",
-                            "Accept-Language": "en-US,en;q=0.9",
-                            "Range": "bytes=0-"
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                            "Referer": "https://bunkr.su/"
                         }
-                        response = session.get(current_file_url, stream=True, timeout=30, headers=headers)
-                        if response.status_code in (200, 206):
-                            file_size = int(response.headers.get("content-length", 0))
-                            downloaded = 0
-                            start_time = time.time()
-                            last_update = start_time
-                            with open(temp_path, "wb") as f:
-                                for chunk in response.iter_content(chunk_size=524288):
-                                    if chunk:
-                                        f.write(chunk)
-                                        downloaded += len(chunk)
-                                        current_time = time.time()
-                                        if current_time - last_update >= 5 and file_size > 0:
-                                            percent = int((downloaded / file_size) * 100)
-                                            elapsed = current_time - start_time
-                                            speed = downloaded / elapsed if elapsed > 0 else 0
-                                            eta = (file_size - downloaded) / speed if speed > 0 else 0
-                                            bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
-                                            speed_mbps = speed / 1024 / 1024
-                                            text = (
-                                                f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:25]}\n"
-                                                f"[{bar}] {percent}%\n"
-                                                f"{human_bytes(downloaded)} / {human_bytes(file_size)}\n"
-                                                f"⚡ Speed: {speed_mbps:.2f} MB/s | ETA: {int(eta // 60)}m {int(eta % 60)}s"
-                                            )
-                                            if text != last_status:
-                                                await safe_edit(status_msg, text)
-                                                last_status = text
-                                            last_update = current_time
-                            # Check if complete
-                            if downloaded == 0:
-                                logger.warning(f"[v0] Empty download from {current_file_url}")
-                                if os.path.exists(temp_path):
-                                    os.remove(temp_path)
-                                continue
-                            if file_size > 0 and downloaded != file_size:
-                                logger.warning(f"[v0] Partial download from {current_file_url}: {downloaded} / {file_size}")
-                                if os.path.exists(temp_path):
-                                    os.remove(temp_path)
-                                continue
-                            # Rename to final
-                            os.rename(temp_path, final_path)
+                        response = session.get(current_file_url, stream=True, timeout=10, headers=headers)
+                        if response.status_code == 200:
+                            file_url = current_file_url
                             success = True
-                            logger.info(f"[v0] Success on domain {tld} with prefix {prefix} for file (HTTP {response.status_code})")
+                            logger.info(f"[v0] Success on domain {tld} for file (HTTP 200)")
                             break
                         elif response.status_code == 404:
-                            logger.warning(f"[v0] HTTP 404 for {current_file_url} on domain {tld} with prefix {prefix}")
-                            continue
+                            logger.warning(f"[v0] HTTP 404 for {current_file_url} on domain {tld}")
+                            continue  # Try next domain instead of breaking
                         else:
-                            logger.warning(f"[v0] Domain {tld} with prefix {prefix} returned HTTP {response.status_code} for file")
+                            logger.warning(f"[v0] Domain {tld} returned HTTP {response.status_code} for file")
                     except requests.exceptions.RequestException as e:
-                        logger.warning(f"[v0] File domain {tld} with prefix {prefix} failed: {e}")
-                if success:
-                    break
+                        logger.warning(f"[v0] File domain {tld} failed: {e}")
            
             if not success:
                 skipped_files.append(file_name)
@@ -506,16 +433,56 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 logger.error(f"Skipped file: {file_name}")
                 continue
            
-            # Validate file size > 0
-            file_size_local = os.path.getsize(final_path)
-            if file_size_local == 0:
-                logger.warning(f"[v0] Empty file after download: {file_name}")
-                os.remove(final_path)
+            # ⚡ OPTIMIZED DOWNLOAD WITH LARGER CHUNKS
+            file_size = int(response.headers.get("content-length", 0))
+            final_path = os.path.join(download_path, file_name)
+            downloaded = 0
+            start_time = time.time()
+            last_update = start_time
+           
+            try:
+                with open(final_path, "wb") as f:
+                    # Use 512KB chunks for faster download
+                    for chunk in response.iter_content(chunk_size=524288): # 512KB chunks
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        current_time = time.time()
+                       
+                        if current_time - last_update >= 5 and file_size > 0:
+                            percent = int((downloaded / file_size) * 100)
+                            elapsed = current_time - start_time
+                            speed = downloaded / elapsed if elapsed > 0 else 0
+                            eta = (file_size - downloaded) / speed if speed > 0 else 0
+                           
+                            bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
+                            speed_mbps = speed / 1024 / 1024
+                           
+                            text = (
+                                f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:25]}\n"
+                                f"[{bar}] {percent}%\n"
+                                f"{human_bytes(downloaded)} / {human_bytes(file_size)}\n"
+                                f"⚡ Speed: {speed_mbps:.2f} MB/s | ETA: {int(eta // 60)}m {int(eta % 60)}s"
+                            )
+                           
+                            if text != last_status:
+                                await safe_edit(status_msg, text)
+                                last_status = text
+                            last_update = current_time
+           
+            except Exception as download_err:
                 skipped_files.append(file_name)
-                await safe_edit(status_msg, f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (empty file)")
+                await safe_edit(
+                    status_msg,
+                    f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (download error)"
+                )
+                logger.exception(f"Download failed for {file_name}: {download_err}")
+                if os.path.exists(final_path):
+                    os.remove(final_path)
                 continue
            
-            # Video metadata extraction and validation
+            # Video metadata extraction
             duration = None
             width = None
             height = None
@@ -524,12 +491,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             if is_video:
                 logger.info(f"[v0] Getting video metadata for {file_name}")
                 duration = get_video_duration(final_path)
-                if duration is None or duration == 0:
-                    logger.warning(f"[v0] Corrupted video file: no duration for {file_name}")
-                    os.remove(final_path)
-                    skipped_files.append(file_name)
-                    await safe_edit(status_msg, f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (corrupted video)")
-                    continue
                 width, height = get_video_resolution_ffprobe(final_path)
                
                 if width is None and MOVIEPY_AVAILABLE:
