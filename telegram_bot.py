@@ -72,7 +72,7 @@ def create_optimized_session():
         pool_connections=10,
         pool_maxsize=20,
         max_retries=Retry(
-            total=5,                    # Increased to 5
+            total=3,                    # Per URL retries
             backoff_factor=2,           # Increased backoff
             status_forcelist=[429, 500, 502, 503, 504, 523, 403],
             allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
@@ -151,12 +151,14 @@ def fix_bunkr_url(url: str) -> str:
     url = url.replace("c.bunkr-cache.se", "c.bunkr.su")
     url = url.replace("bunkr-cache.se", "bunkr.su")
     url = url.replace("c.bunkr.is", "c.bunkr.su")
-    url = url.replace("bunkr", "bunkrr")  # Handle new bunkrr variations
+    url = url.replace("bunkrrr", "bunkrr")  # Correct triple r if any
+    url = url.replace("bunkr", "bunkrr")  # Standardize to bunkrr
     return url
 
 def get_alternative_urls(url: str) -> list:
     parsed = urlparse(url)
     netloc = parsed.netloc
+    path = parsed.path
     if not netloc:
         return [url]
     
@@ -165,25 +167,29 @@ def get_alternative_urls(url: str) -> list:
         return [url]
     
     subdomain = parts[0]
-    domain = parts[1]
-    tld = '.'.join(parts[2:])
+    domain = '.'.join(parts[1:-1])  # Handle bunkrr as domain
+    tld = parts[-1]
     
-    domain_variations = ['bunkr', 'bunkrr']  # Handle both variations
+    subdomain_variations = ['', 'c', 'cdn', 'cdn1', 'cdn2', 'media', 'stream', 'get', 'dl', 'files']
+    domain_variations = ['bunkr', 'bunkrr', 'cyberdrop']
     
     # Expanded to all possible from URL_PATTERN
     possible_tlds = ['su', 'is', 'la', 'ru', 'media', 'sk', 'pk', 'si', 'ph', 'ps', 'ci', 'ax', 'fi', 'ac', 'black', 'red', 'site', 'ws', 'org', 'cat', 'cc', 'com', 'net', 'to', 'cr']
     random.shuffle(possible_tlds)
     
-    alternatives = []
-    for var_domain in domain_variations:
-        for new_tld in possible_tlds:
-            if new_tld == tld and var_domain == domain:
-                continue
-            new_netloc = f"{subdomain}.{var_domain}.{new_tld}"
-            new_parsed = parsed._replace(netloc=new_netloc)
-            alternatives.append(urlunparse(new_parsed))
+    alternatives = set()
+    for sub in subdomain_variations:
+        for dom in domain_variations:
+            for new_tld in possible_tlds:
+                if sub == subdomain and dom == domain and new_tld == tld:
+                    continue
+                new_netloc = f"{sub}.{dom}.{new_tld}" if sub else f"{dom}.{new_tld}"
+                new_parsed = parsed._replace(netloc=new_netloc)
+                alternatives.add(urlunparse(new_parsed))
     
-    return [url] + alternatives
+    alt_list = list(alternatives)
+    random.shuffle(alt_list)
+    return [url] + alt_list
 
 def get_direct_download_url(session, page_url, is_file=False, name=''):
     """Custom function to extract direct download URL, prioritizing modern bunkr patterns"""
@@ -196,21 +202,26 @@ def get_direct_download_url(session, page_url, is_file=False, name=''):
         soup = BeautifulSoup(r.content, 'html.parser')
         
         # Priority 1: Modern download link (e.g., https://get.bunkrr.su/file/...)
-        download_a = soup.find('a', href=re.compile(r'https?://get\.bunkrr?\.(su|is|la|ru|media|etc)/file/\d+'))
+        download_a = soup.find('a', href=re.compile(r'https?://(?:get|dl|files)\.bunkr(r)?\.(su|is|la|ru|media|sk|pk|etc)/file/[\w-]+'))
         if download_a:
-            return {'url': download_a['href'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip()}
+            return {'url': download_a['href'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip() if soup.find('h1', {'class': ['text-[20px]', 'truncate']}) else name}
         
-        # Fallback: Video source src (old pattern)
+        # Fallback 1: Video source src (old pattern)
         video = soup.find('video')
         if video:
             source = video.find('source')
             if source and 'src' in source.attrs:
-                return {'url': source['src'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip()}
+                return {'url': source['src'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip() if soup.find('h1', {'class': ['text-[20px]', 'truncate']}) else name}
+        
+        # Fallback 2: Stream link or other
+        stream_a = soup.find('a', href=re.compile(r'https?://(?:stream|media|cdn|c)\.bunkr(r)?\.(su|is|la|ru|media|sk|pk|etc)/v/[\w-]+'))
+        if stream_a:
+            return {'url': stream_a['href'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip() if soup.find('h1', {'class': ['text-[20px]', 'truncate']}) else name}
         
         # Additional fallback: Any a with 'download' in text or class
-        fallback_a = soup.find('a', string=re.compile('download', re.I)) or soup.find('a', {'class': re.compile('download')})
+        fallback_a = soup.find('a', string=re.compile('download', re.I)) or soup.find('a', {'class': re.compile('download|btn')})
         if fallback_a and 'href' in fallback_a.attrs:
-            return {'url': fallback_a['href'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip()}
+            return {'url': fallback_a['href'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip() if soup.find('h1', {'class': ['text-[20px]', 'truncate']}) else name}
         
         logger.warning(f"No download URL found on {page_url}")
         return None
@@ -466,14 +477,14 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             
             urls_to_try = get_alternative_urls(file_url)
             
-            for try_url in urls_to_try:
-                logger.info(f"Trying download from {try_url}")
+            for try_idx, try_url in enumerate(urls_to_try, 1):
+                logger.info(f"Trying download from {try_url} ({try_idx}/{len(urls_to_try)})")
                 try:
                     headers = {
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                         "Referer": "https://bunkr.su/"
                     }
-                    response = session.get(try_url, stream=True, timeout=30, headers=headers)  # Increased timeout
+                    response = session.get(try_url, stream=True, timeout=60, headers=headers)  # Increased timeout
                     
                     if response.status_code == 200:
                         success = True
@@ -481,7 +492,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         break
                     elif response.status_code == 404:
                         logger.warning(f"HTTP 404 for {try_url}")
-                        break
                     else:
                         logger.warning(f"HTTP {response.status_code} for {try_url}")
                 
@@ -491,6 +501,8 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                     logger.warning(f"Connection error (e.g., DNS) for {try_url}")
                 except Exception as e:
                     logger.warning(f"Failed to download from {try_url}: {str(e)}")
+                
+                await asyncio.sleep(1)  # Short sleep between tries
             
             if not success:
                 skipped_files.append(file_name)
