@@ -62,18 +62,18 @@ app = Client(
     workdir=".",
 )
 
-# Enhanced session with connection pooling — INCREASED RETRIES AND BACKOFF
+# Enhanced session with connection pooling — REDUCED RETRIES TO 0, AS PER USER (NO AUTOMATIC RETRIES)
 def create_optimized_session():
     """Create session with optimized connection pooling"""
     session = requests.Session()
     
-    # Connection pooling + more retries + longer backoff
+    # Connection pooling + no retries
     adapter = HTTPAdapter(
         pool_connections=10,
         pool_maxsize=20,
         max_retries=Retry(
-            total=3,                    # Per URL retries
-            backoff_factor=2,           # Increased backoff
+            total=0,                    # No retries
+            backoff_factor=0,
             status_forcelist=[429, 500, 502, 503, 504, 523, 403],
             allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
         )
@@ -170,7 +170,7 @@ def get_alternative_urls(url: str) -> list:
     domain = '.'.join(parts[1:-1])  # Handle bunkrr as domain
     tld = parts[-1]
     
-    subdomain_variations = ['', 'c', 'cdn', 'cdn1', 'cdn2', 'media', 'stream', 'get', 'dl', 'files']
+    subdomain_variations = ['', 'c', 'cdn', 'cdn1', 'cdn2', 'cdn3', 'cdn4', 'media', 'stream', 'get', 'dl', 'files']
     domain_variations = ['bunkr', 'bunkrr', 'cyberdrop']
     
     # Expanded to all possible from URL_PATTERN
@@ -202,7 +202,7 @@ def get_direct_download_url(session, page_url, is_file=False, name=''):
         soup = BeautifulSoup(r.content, 'html.parser')
         
         # Priority 1: Modern download link (e.g., https://get.bunkrr.su/file/...)
-        download_a = soup.find('a', href=re.compile(r'https?://(?:get|dl|files)\.bunkr(r)?\.(su|is|la|ru|media|sk|pk|etc)/file/[\w-]+'))
+        download_a = soup.find('a', href=re.compile(r'https?://(?:get|dl|files)\.bunkrr?\.(su|is|la|ru|media|sk|pk|etc)/file/[\w-]+'))
         if download_a:
             return {'url': download_a['href'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip() if soup.find('h1', {'class': ['text-[20px]', 'truncate']}) else name}
         
@@ -214,7 +214,7 @@ def get_direct_download_url(session, page_url, is_file=False, name=''):
                 return {'url': source['src'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip() if soup.find('h1', {'class': ['text-[20px]', 'truncate']}) else name}
         
         # Fallback 2: Stream link or other
-        stream_a = soup.find('a', href=re.compile(r'https?://(?:stream|media|cdn|c)\.bunkr(r)?\.(su|is|la|ru|media|sk|pk|etc)/v/[\w-]+'))
+        stream_a = soup.find('a', href=re.compile(r'https?://(?:stream|media|cdn|c)\.bunkrr?\.(su|is|la|ru|media|sk|pk|etc)/v/[\w-]+'))
         if stream_a:
             return {'url': stream_a['href'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip() if soup.find('h1', {'class': ['text-[20px]', 'truncate']}) else name}
         
@@ -245,6 +245,35 @@ def get_video_duration_ffprobe(video_path: str) -> int:
     except Exception as e:
         logger.warning(f"[v0] ffprobe duration failed: {e}")
     return None
+
+def is_valid_video(file_path: str) -> bool:
+    """Check if the downloaded file is a valid video"""
+    if not os.path.exists(file_path) or os.path.getsize(file_path) < 1000:
+        return False
+    
+    duration = get_video_duration_ffprobe(file_path)
+    if duration is not None and duration > 0:
+        return True
+    
+    if MOVIEPY_AVAILABLE:
+        try:
+            clip = VideoFileClip(file_path)
+            duration = clip.duration
+            clip.close()
+            return duration > 0
+        except Exception:
+            pass
+    
+    if OPENCV_AVAILABLE:
+        try:
+            cap = cv2.VideoCapture(file_path)
+            ret = cap.isOpened()
+            cap.release()
+            return ret
+        except Exception:
+            pass
+    
+    return False
 
 def get_video_duration(video_path: str) -> int:
     """Returns video duration in seconds"""
@@ -484,25 +513,65 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                         "Referer": "https://bunkr.su/"
                     }
-                    response = session.get(try_url, stream=True, timeout=60, headers=headers)  # Increased timeout
+                    response = session.get(try_url, stream=True, timeout=10, headers=headers)  # 10s timeout
                     
                     if response.status_code == 200:
-                        success = True
-                        file_url = try_url
-                        break
+                        # Download to temp path first
+                        temp_path = os.path.join(download_path, f"temp_{file_name}")
+                        file_size = int(response.headers.get("content-length", 0))
+                        downloaded = 0
+                        start_time = time.time()
+                        last_update = start_time
+                        
+                        with open(temp_path, "wb") as f:
+                            for chunk in response.iter_content(chunk_size=524288):
+                                if chunk:
+                                    f.write(chunk)
+                                    downloaded += len(chunk)
+                                    current_time = time.time()
+                                    
+                                    if current_time - last_update >= 5 and file_size > 0:
+                                        percent = int((downloaded / file_size) * 100)
+                                        elapsed = current_time - start_time
+                                        speed = downloaded / elapsed if elapsed > 0 else 0
+                                        eta = (file_size - downloaded) / speed if speed > 0 else 0
+                                        
+                                        bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
+                                        speed_mbps = speed / 1024 / 1024
+                                        
+                                        text = (
+                                            f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:25]}\n"
+                                            f"[{bar}] {percent}%\n"
+                                            f"{human_bytes(downloaded)} / {human_bytes(file_size)}\n"
+                                            f"⚡ Speed: {speed_mbps:.2f} MB/s | ETA: {int(eta // 60)}m {int(eta % 60)}s"
+                                        )
+                                        
+                                        if text != last_status:
+                                            await safe_edit(status_msg, text)
+                                            last_status = text
+                                        last_update = current_time
+                        
+                        # Validate the downloaded file
+                        if is_valid_video(temp_path):
+                            os.rename(temp_path, os.path.join(download_path, file_name))
+                            success = True
+                            file_url = try_url
+                            break
+                        else:
+                            logger.warning(f"Invalid or corrupted file from {try_url}, deleting")
+                            os.remove(temp_path)
+                    
                     elif response.status_code == 404:
                         logger.warning(f"HTTP 404 for {try_url}")
                     else:
                         logger.warning(f"HTTP {response.status_code} for {try_url}")
                 
-                except requests.exceptions.ConnectTimeout:
-                    logger.warning(f"Connect timeout for {try_url}")
+                except requests.exceptions.Timeout:
+                    logger.warning(f"Timeout (10s) for {try_url}")
                 except requests.exceptions.ConnectionError:
                     logger.warning(f"Connection error (e.g., DNS) for {try_url}")
                 except Exception as e:
                     logger.warning(f"Failed to download from {try_url}: {str(e)}")
-                
-                await asyncio.sleep(1)  # Short sleep between tries
             
             if not success:
                 skipped_files.append(file_name)
@@ -513,53 +582,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 logger.error(f"Skipped file: {file_name}")
                 continue
             
-            # ⚡ OPTIMIZED DOWNLOAD WITH LARGER CHUNKS
-            file_size = int(response.headers.get("content-length", 0))
             final_path = os.path.join(download_path, file_name)
-            downloaded = 0
-            start_time = time.time()
-            last_update = start_time
-            
-            try:
-                with open(final_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=524288):  # 512KB chunks
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        current_time = time.time()
-                        
-                        if current_time - last_update >= 5 and file_size > 0:
-                            percent = int((downloaded / file_size) * 100)
-                            elapsed = current_time - start_time
-                            speed = downloaded / elapsed if elapsed > 0 else 0
-                            eta = (file_size - downloaded) / speed if speed > 0 else 0
-                            
-                            bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
-                            speed_mbps = speed / 1024 / 1024
-                            
-                            text = (
-                                f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:25]}\n"
-                                f"[{bar}] {percent}%\n"
-                                f"{human_bytes(downloaded)} / {human_bytes(file_size)}\n"
-                                f"⚡ Speed: {speed_mbps:.2f} MB/s | ETA: {int(eta // 60)}m {int(eta % 60)}s"
-                            )
-                            
-                            if text != last_status:
-                                await safe_edit(status_msg, text)
-                                last_status = text
-                            last_update = current_time
-            
-            except Exception as download_err:
-                skipped_files.append(file_name)
-                await safe_edit(
-                    status_msg,
-                    f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (download error)"
-                )
-                logger.exception(f"Download failed for {file_name}: {download_err}")
-                if os.path.exists(final_path):
-                    os.remove(final_path)
-                continue
             
             # Video metadata extraction
             duration = None
