@@ -62,7 +62,7 @@ app = Client(
     workdir=".",
 )
 
-# Enhanced session with connection pooling — REDUCED RETRIES TO 0, AS PER USER (NO AUTOMATIC RETRIES)
+# Enhanced session with connection pooling — NO RETRIES, 10s TIMEOUT
 def create_optimized_session():
     """Create session with optimized connection pooling"""
     session = requests.Session()
@@ -72,7 +72,7 @@ def create_optimized_session():
         pool_connections=10,
         pool_maxsize=20,
         max_retries=Retry(
-            total=0,                    # No retries
+            total=0,
             backoff_factor=0,
             status_forcelist=[429, 500, 502, 503, 504, 523, 403],
             allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
@@ -170,7 +170,7 @@ def get_alternative_urls(url: str) -> list:
     domain = '.'.join(parts[1:-1])  # Handle bunkrr as domain
     tld = parts[-1]
     
-    subdomain_variations = ['', 'c', 'cdn', 'cdn1', 'cdn2', 'cdn3', 'cdn4', 'media', 'stream', 'get', 'dl', 'files']
+    subdomain_variations = ['', 'c', 'cdn', 'cdn1', 'cdn2', 'cdn3', 'cdn4', 'media', 'stream', 'get', 'dl', 'files', 'media-files']
     domain_variations = ['bunkr', 'bunkrr', 'cyberdrop']
     
     # Expanded to all possible from URL_PATTERN
@@ -201,27 +201,28 @@ def get_direct_download_url(session, page_url, is_file=False, name=''):
         
         soup = BeautifulSoup(r.content, 'html.parser')
         
-        # Priority 1: Modern download link (e.g., https://get.bunkrr.su/file/...)
-        download_a = soup.find('a', href=re.compile(r'https?://(?:get|dl|files)\.bunkrr?\.(su|is|la|ru|media|sk|pk|etc)/file/[\w-]+'))
-        if download_a:
-            return {'url': download_a['href'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip() if soup.find('h1', {'class': ['text-[20px]', 'truncate']}) else name}
+        # Priority 1: Download button
+        download_btn = soup.find('a', string=re.compile('download', re.I)) or soup.find('a', {'class': re.compile('btn|download|primary')})
+        if download_btn and 'href' in download_btn.attrs:
+            dl_url = download_btn['href']
+            if not dl_url.startswith('https'):
+                dl_url = urljoin(page_url, dl_url)
+            return {'url': dl_url, 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip() if soup.find('h1', {'class': ['text-[20px]', 'truncate']}) else name}
         
-        # Fallback 1: Video source src (old pattern)
+        # Fallback 1: Video source src
         video = soup.find('video')
         if video:
             source = video.find('source')
             if source and 'src' in source.attrs:
-                return {'url': source['src'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip() if soup.find('h1', {'class': ['text-[20px]', 'truncate']}) else name}
+                src_url = source['src']
+                if not src_url.startswith('https'):
+                    src_url = urljoin(page_url, src_url)
+                return {'url': src_url, 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip() if soup.find('h1', {'class': ['text-[20px]', 'truncate']}) else name}
         
-        # Fallback 2: Stream link or other
-        stream_a = soup.find('a', href=re.compile(r'https?://(?:stream|media|cdn|c)\.bunkrr?\.(su|is|la|ru|media|sk|pk|etc)/v/[\w-]+'))
-        if stream_a:
-            return {'url': stream_a['href'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip() if soup.find('h1', {'class': ['text-[20px]', 'truncate']}) else name}
-        
-        # Additional fallback: Any a with 'download' in text or class
-        fallback_a = soup.find('a', string=re.compile('download', re.I)) or soup.find('a', {'class': re.compile('download|btn')})
-        if fallback_a and 'href' in fallback_a.attrs:
-            return {'url': fallback_a['href'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip() if soup.find('h1', {'class': ['text-[20px]', 'truncate']}) else name}
+        # Fallback 2: Any mp4 link
+        mp4_link = soup.find('a', href=re.compile(r'https?://.*\.mp4'))
+        if mp4_link:
+            return {'url': mp4_link['href'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip() if soup.find('h1', {'class': ['text-[20px]', 'truncate']}) else name}
         
         logger.warning(f"No download URL found on {page_url}")
         return None
@@ -272,6 +273,15 @@ def is_valid_video(file_path: str) -> bool:
             return ret
         except Exception:
             pass
+    
+    # Additional check for MP4 header
+    try:
+        with open(file_path, 'rb') as f:
+            header = f.read(12)
+            if header[4:8] == b'ftyp':
+                return True
+    except Exception:
+        pass
     
     return False
 
@@ -510,7 +520,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 logger.info(f"Trying download from {try_url} ({try_idx}/{len(urls_to_try)})")
                 try:
                     headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
                         "Referer": "https://bunkr.su/"
                     }
                     response = session.get(try_url, stream=True, timeout=10, headers=headers)  # 10s timeout
@@ -550,6 +560,13 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                                             await safe_edit(status_msg, text)
                                             last_status = text
                                         last_update = current_time
+                        
+                        # Check if downloaded size matches
+                        actual_size = os.path.getsize(temp_path)
+                        if file_size > 0 and actual_size != file_size:
+                            logger.warning(f"Incomplete download from {try_url}: {actual_size} / {file_size}, deleting")
+                            os.remove(temp_path)
+                            continue
                         
                         # Validate the downloaded file
                         if is_valid_video(temp_path):
