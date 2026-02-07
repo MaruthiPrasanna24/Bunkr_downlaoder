@@ -6,13 +6,6 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from dotenv import load_dotenv
 import logging
-from dump import (
-    get_items_list,
-    create_session,
-    get_and_prepare_download_path,
-    get_real_download_url,
-    get_url_data
-)
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -54,7 +47,7 @@ app = Client(
     workdir=".",
 )
 # Bunkr domain fallbacks (expanded)
-DOMAINS = ['la', 'su', 'is', 'ru', 'pk', 'sk', 'ph', 'ps', 'ci', 'ax', 'fi', 'ac', 'ws', 'red', 'site', 'black', 'cat', 'cc', 'org', 'cr', 'si', 'media', 'to', 'net', 'com', 'fi', 'albums.io']
+DOMAINS = ['cr', 'la', 'su', 'is', 'ru', 'pk', 'sk', 'ph', 'ps', 'ci', 'ax', 'fi', 'ac', 'ws', 'red', 'site', 'black', 'cat', 'cc', 'org', 'si', 'media', 'to', 'net', 'com', 'fi', 'albums.io']
 # Known CDN prefixes (expanded)
 CDN_PREFIXES = (
     [f'cdn{i}.' for i in range(1, 13)] +
@@ -66,8 +59,8 @@ CDN_PREFIXES = (
 def create_optimized_session():
     """Create session with optimized connection pooling"""
     session = requests.Session()
-    session.verify = False  # Disable SSL verification for sites with weak certs
-   
+    session.verify = False # Disable SSL verification for sites with weak certs
+  
     # Connection pooling with increased pool size
     adapter = HTTPAdapter(
         pool_connections=10,
@@ -79,7 +72,7 @@ def create_optimized_session():
             allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
         )
     )
-   
+  
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
@@ -116,29 +109,29 @@ def human_bytes(size):
 async def optimized_upload_progress(current, total, status_msg, file_name, idx, total_items, last_update_time, start_time):
     if total == 0:
         return
-   
+  
     current_time = time.time()
     if current_time - last_update_time[0] < 3: # Update every 3 seconds for better speed display
         return
-   
+  
     last_update_time[0] = current_time
     percent = int(current * 100 / total)
     elapsed = current_time - start_time
     speed = current / elapsed if elapsed > 0 else 0
     eta = (total - current) / speed if speed > 0 else 0
-   
+  
     bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
-   
+  
     # Show speed in MB/s
     speed_mbps = (speed / 1024 / 1024)
-   
+  
     text = (
         f"📤 Uploading [{idx}/{total_items}]: {file_name[:25]}...\n"
         f"[{bar}] {percent}%\n"
         f"{human_bytes(current)} / {human_bytes(total)}\n"
         f"⚡ Speed: {speed_mbps:.2f} MB/s | ETA: {int(eta // 60)}m {int(eta % 60)}s"
     )
-   
+  
     await safe_edit(status_msg, text)
 def fix_bunkr_url(url: str) -> str:
     """Fix unstable Bunkr CDN domains"""
@@ -167,11 +160,11 @@ def get_video_duration(video_path: str) -> int:
     if not os.path.exists(video_path):
         logger.warning(f"[v0] Video file not found: {video_path}")
         return None
-   
+  
     duration = get_video_duration_ffprobe(video_path)
     if duration is not None and duration > 0:
         return duration
-   
+  
     if MOVIEPY_AVAILABLE:
         try:
             clip = VideoFileClip(video_path)
@@ -182,7 +175,7 @@ def get_video_duration(video_path: str) -> int:
                 return duration
         except Exception as e:
             logger.warning(f"[v0] MoviePy duration failed: {e}")
-   
+  
     if OPENCV_AVAILABLE:
         try:
             cap = cv2.VideoCapture(video_path)
@@ -197,7 +190,7 @@ def get_video_duration(video_path: str) -> int:
                         return duration
         except Exception as e:
             logger.warning(f"[v0] OpenCV duration failed: {e}")
-   
+  
     return None
 def get_video_resolution_ffprobe(video_path: str) -> tuple:
     """Get video resolution using ffprobe"""
@@ -290,7 +283,7 @@ async def generate_video_thumbnail(video_path: str, output_path: str) -> bool:
     if not os.path.exists(video_path):
         logger.warning(f"[v0] Video file not found for thumbnail: {video_path}")
         return False
-   
+  
     if await generate_video_thumbnail_ffmpeg(video_path, output_path):
         return True
     if MOVIEPY_AVAILABLE and await generate_video_thumbnail_moviepy(video_path, output_path):
@@ -299,33 +292,158 @@ async def generate_video_thumbnail(video_path: str, output_path: str) -> bool:
         return True
     if await generate_fallback_thumbnail(video_path, output_path):
         return True
-   
+  
     logger.warning(f"[v0] No thumbnail generated for {video_path}")
     return False
+def get_real_download_url(session: requests.Session, page_url: str, is_direct: bool = False, default_name: str = "file") -> dict | str | None:
+    """
+    Extract the real direct download URL from a Bunkr / Cyberdrop file/view page.
+    
+    Returns:
+        - dict with {'url': direct_url, 'name': filename}   (preferred)
+        - or just the direct string URL
+        - or None if failed
+    """
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": page_url,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        }
+        
+        r = session.get(page_url, headers=headers, timeout=12, allow_redirects=True)
+        if r.status_code != 200:
+            logger.warning(f"Failed to fetch page {page_url} → HTTP {r.status_code}")
+            return None
+
+        soup = BeautifulSoup(r.text, 'html.parser')
+
+        domain = urlparse(page_url).netloc.lower()
+        is_cyberdrop = any(x in domain for x in ['cyberdrop'])
+
+        direct_url = None
+        filename = default_name
+
+        # ────────────────────────────────────────────────
+        #  Cyberdrop patterns
+        # ────────────────────────────────────────────────
+        if is_cyberdrop:
+            # Most common: <a id="download" href="...">
+            dl_link = soup.find('a', id='download')
+            if dl_link and dl_link.get('href'):
+                direct_url = urljoin(page_url, dl_link['href'])
+            
+            # Fallback 1: video source
+            if not direct_url:
+                video = soup.find('video', id='videoplayer') or soup.find('video')
+                if video and video.get('src'):
+                    direct_url = urljoin(page_url, video['src'])
+
+            # Fallback 2: main image
+            if not direct_url:
+                img = soup.find('img', id='img') or soup.find('img', class_='img') or soup.find('img', {'data-src': True})
+                if img:
+                    src = img.get('src') or img.get('data-src')
+                    if src:
+                        direct_url = urljoin(page_url, src)
+
+            # Try to get better filename
+            title = soup.find('h1', id='title')
+            if title and title.text.strip():
+                filename = title.text.strip()
+
+            # Clean filename if needed
+            if filename == default_name:
+                # fallback from URL or metadata
+                pass
+
+        # ────────────────────────────────────────────────
+        #  Bunkr / bunkrrr patterns (your original logic roughly)
+        # ────────────────────────────────────────────────
+        else:
+            # Many bunkr file pages redirect or use <video>/<source>
+            video = soup.find('video')
+            if video:
+                source = video.find('source')
+                if source and source.get('src'):
+                    direct_url = urljoin(page_url, source['src'])
+                elif video.get('src'):
+                    direct_url = urljoin(page_url, video['src'])
+
+            # Image fallback
+            if not direct_url:
+                img = soup.find('img', class_='img') or soup.find('img', {'data-src': True})
+                if img:
+                    direct_url = img.get('data-src') or img.get('src')
+                    if direct_url:
+                        direct_url = urljoin(page_url, direct_url)
+
+            # Some bunkr use JSON in script tags or data attributes
+            if not direct_url:
+                scripts = soup.find_all('script')
+                for script in scripts:
+                    if script.string and 'var data = ' in script.string:
+                        match = re.search(r'var data = (\{.*?\});', script.string, re.DOTALL)
+                        if match:
+                            try:
+                                data = json.loads(match.group(1))
+                                if 'file' in data and 'url' in data['file']:
+                                    direct_url = data['file']['url']
+                                    break
+                            except:
+                                pass
+
+        if not direct_url:
+            logger.warning(f"No direct URL found on page: {page_url}")
+            return None
+
+        # Final cleanup
+        direct_url = fix_bunkr_url(direct_url)  # keep your fixer if needed
+
+        # Try to get extension from URL if filename has no ext
+        if '.' not in filename or len(filename.split('.')[-1]) > 5:
+            ext = direct_url.split('.')[-1].split('?')[0].split('#')[0]
+            if ext.lower() in {'jpg','jpeg','png','gif','webp','mp4','webm','mov'}:
+                filename = f"{default_name}.{ext}"
+
+        # Return structured result (your code already handles both dict and str)
+        return {
+            "url": direct_url,
+            "name": filename
+        }
+
+    except Exception as e:
+        logger.exception(f"Error extracting direct URL from {page_url}: {e}")
+        return None
+def get_and_prepare_download_path(downloads_dir, album_name):
+    path = os.path.join(downloads_dir, album_name)
+    if not os.path.exists(path):
+        os.makedirs(path)
+    return path
 # ⚡ OPTIMIZED FILE UPLOAD WITH FASTER SPEED (7-10 MB/s target)
 async def download_and_send_file(client: Client, message: Message, url: str, session: requests.Session):
     try:
         logger.info(f"[v0] Starting download_and_send_file for: {url}")
         status_msg = await message.reply_text(f"🔄 Processing: {url[:50]}...")
         last_status = ""
-       
+      
         is_bunkr = "bunkr" in url or "bunkrrr" in url or "bunkr-albums" in url
         is_cyberdrop = "cyberdrop" in url.lower()
         logger.info(f"[v0] is_bunkr: {is_bunkr}, is_cyberdrop: {is_cyberdrop}")
-       
+      
         if not is_bunkr and not is_cyberdrop:
             await safe_edit(status_msg, "❌ Unsupported URL")
             return
-       
+      
         if not url.startswith("https"):
             url = f"https://{url}"
-       
+      
         # Parse path for domain fallback
         parsed = urlparse(url)
         path = parsed.path
         if parsed.query:
             path += '?' + parsed.query
-        
+       
         # Fetch album/page with domain fallback
         r = None
         soup = None
@@ -339,26 +457,26 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 r = session.get(current_url, timeout=15)
                 if r.status_code == 200:
                     soup = BeautifulSoup(r.content, 'html.parser')
-                    url = current_url  # Update for urljoin
+                    url = current_url # Update for urljoin
                     logger.info(f"[v0] Success on domain {tld} for album (HTTP 200)")
                     break
                 else:
                     logger.warning(f"[v0] Domain {tld} returned HTTP {r.status_code} for album")
             except requests.exceptions.RequestException as e:
                 logger.warning(f"[v0] Domain {tld} failed for album: {e}")
-        
+       
         if soup is None:
             await safe_edit(status_msg, "❌ Failed to fetch from all domains")
             return
-       
+      
         items = []
-       
+      
         if is_bunkr:
             is_direct = (
                 soup.find('span', {'class': 'ic-videos'}) is not None or
                 soup.find('div', {'class': 'lightgallery'}) is not None
             )
-           
+          
             if is_direct:
                 h1 = soup.find('h1', {'class': 'text-[20px]'}) or soup.find('h1', {'class': 'truncate'})
                 album_name = h1.text if h1 else "file"
@@ -378,13 +496,15 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             items.append(direct_item)
         elif is_cyberdrop:
             album_name = soup.find('h1', id='title').text.strip() if soup.find('h1', id='title') else "album"
-            # Check for single file
-            single_image = soup.find('img', id='image')
-            single_video = soup.find('video', id='video')
-            if single_image or single_video:
-                file_url = single_image['src'] if single_image else single_video['src'] if single_video else None
-                if file_url:
-                    items.append({"url": urljoin(url, file_url), "name": album_name})
+            is_direct = (
+                soup.find('img', id='img') is not None or
+                soup.find('video', id='videoplayer') is not None or
+                soup.find('a', id='download') is not None
+            )
+            if is_direct:
+                item = get_real_download_url(session, url, True, album_name)
+                if item:
+                    items.append(item)
             else:
                 # Album
                 for div in soup.find_all('div', class_='image-container column'):
@@ -395,17 +515,17 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         direct_item = get_real_download_url(session, view_url, True, name)
                         if direct_item:
                             items.append(direct_item)
-       
+      
         if not items:
             await safe_edit(status_msg, "❌ No downloadable items found")
             return
-       
+      
         download_path = get_and_prepare_download_path(DOWNLOADS_DIR, album_name)
         await safe_edit(status_msg, f"📥 Found {len(items)} items. Starting...")
-       
+      
         skipped_files = []
         seen_urls = set()
-       
+      
         for idx, item in enumerate(items, 1):
             if isinstance(item, dict):
                 file_url = item.get("url")
@@ -413,27 +533,27 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             else:
                 file_url = item
                 file_name = album_name
-           
+          
             if file_url in seen_urls:
                 logger.info(f"Skipping duplicate file_url: {file_url}")
                 continue
-           
+          
             seen_urls.add(file_url)
             file_url = fix_bunkr_url(file_url)
             logger.info(f"[v0] Original file URL: {file_url}")
-           
+          
             await safe_edit(
                 status_msg,
                 f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:30]}"
             )
-           
+          
             # File download with domain fallback
             success = False
             file_parsed = urlparse(file_url)
             file_path = file_parsed.path
             if file_parsed.query:
                 file_path += '?' + file_parsed.query
-            
+           
             # Extract original prefix
             parts = file_parsed.netloc.split('.')
             if len(parts) > 1:
@@ -442,13 +562,13 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             else:
                 original_prefix = ''
                 original_tld = ''
-            
+           
             # Prioritize original, then others
             prefixes = [original_prefix] + [p for p in CDN_PREFIXES if p != original_prefix]
-            
+           
             final_path = os.path.join(download_path, file_name)
             temp_path = os.path.join(download_path, f"temp_{file_name}")
-            
+           
             for prefix in prefixes:
                 for tld in DOMAINS:
                     if tld == 'albums.io':
@@ -520,7 +640,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         logger.warning(f"[v0] File domain {tld} with prefix {prefix} failed: {e}")
                 if success:
                     break
-           
+          
             if not success:
                 skipped_files.append(file_name)
                 await safe_edit(
@@ -529,7 +649,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 )
                 logger.error(f"Skipped file: {file_name}")
                 continue
-           
+          
             # Validate file size > 0
             file_size_local = os.path.getsize(final_path)
             if file_size_local == 0:
@@ -538,13 +658,13 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 skipped_files.append(file_name)
                 await safe_edit(status_msg, f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (empty file)")
                 continue
-           
+          
             # Video metadata extraction and validation
             duration = None
             width = None
             height = None
             is_video = file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm'))
-           
+          
             if is_video:
                 logger.info(f"[v0] Getting video metadata for {file_name}")
                 duration = get_video_duration(final_path)
@@ -555,7 +675,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                     await safe_edit(status_msg, f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (corrupted video)")
                     continue
                 width, height = get_video_resolution_ffprobe(final_path)
-               
+              
                 if width is None and MOVIEPY_AVAILABLE:
                     try:
                         clip = VideoFileClip(final_path)
@@ -563,7 +683,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         clip.close()
                     except Exception as e:
                         logger.warning(f"[v0] MoviePy resolution failed: {e}")
-               
+              
                 if width is None and OPENCV_AVAILABLE:
                     try:
                         cap = cv2.VideoCapture(final_path)
@@ -573,7 +693,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             cap.release()
                     except Exception as e:
                         logger.warning(f"[v0] OpenCV resolution failed: {e}")
-           
+          
             # Thumbnail generation
             thumb_path = None
             if is_video:
@@ -583,16 +703,16 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 success_thumb = await generate_video_thumbnail(final_path, thumb_path)
                 if not success_thumb or not os.path.exists(thumb_path):
                     thumb_path = None
-           
+          
             # ⚡ OPTIMIZED UPLOAD TO TELEGRAM WITH FASTER SPEED
             await safe_edit(
                 status_msg,
                 f"📤 Uploading [{idx}/{len(items)}]: {file_name[:30]}"
             )
-           
+          
             upload_start_time = time.time()
             last_update_time = [upload_start_time]
-           
+          
             try:
                 # Open file in binary mode with optimized buffering
                 with open(final_path, "rb") as f:
@@ -605,7 +725,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             "progress": optimized_upload_progress,
                             "progress_args": (status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         }
-                       
+                      
                         # Add optional parameters only if they're valid
                         if thumb_path and os.path.exists(thumb_path):
                             send_kwargs["thumb"] = thumb_path
@@ -615,9 +735,9 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             send_kwargs["width"] = width
                         if height is not None and height > 0:
                             send_kwargs["height"] = height
-                       
+                      
                         await client.send_video(**send_kwargs)
-                   
+                  
                     elif file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
                         await client.send_photo(
                             message.chat.id,
@@ -626,7 +746,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             progress=optimized_upload_progress,
                             progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         )
-                   
+                  
                     else:
                         await client.send_document(
                             message.chat.id,
@@ -635,32 +755,32 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             progress=optimized_upload_progress,
                             progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         )
-               
+              
                 # Log final upload speed
                 total_upload_time = time.time() - upload_start_time
                 file_size_mb = os.path.getsize(final_path) / 1024 / 1024
                 upload_speed_mbps = file_size_mb / total_upload_time if total_upload_time > 0 else 0
                 logger.info(f"[v0] Upload complete for {file_name}: {upload_speed_mbps:.2f} MB/s")
-           
+          
             except Exception as upload_err:
                 logger.exception(f"Upload failed for {file_name}: {upload_err}")
                 await safe_edit(status_msg, f"⚠️ Upload failed for {file_name[:30]}")
-           
+          
             # Cleanup
             if os.path.exists(final_path):
                 os.remove(final_path)
             if thumb_path and os.path.exists(thumb_path):
                 os.remove(thumb_path)
-       
+      
         # Final summary
         summary = f"✅ Done! {album_name}\n"
         if skipped_files:
             summary += f"⚠️ Skipped {len(skipped_files)} file(s): {', '.join(skipped_files[:3])}"
             if len(skipped_files) > 3:
                 summary += f" + {len(skipped_files)-3} more"
-       
+      
         await safe_edit(status_msg, summary)
-   
+  
     except Exception as e:
         logger.exception(e)
         await message.reply_text(f"❌ Critical error (album aborted): {str(e)[:100]}")
@@ -668,13 +788,13 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
 async def handle_message(client: Client, message: Message):
     urls = extract_urls(message.text)
     unique_urls = list(set(urls))
-   
+  
     if not unique_urls:
         return
-   
+  
     # Use optimized session with connection pooling
     session = create_optimized_session()
-   
+  
     for url in unique_urls:
         if is_valid_bunkr_url(url):
             await download_and_send_file(client, message, url, session)
