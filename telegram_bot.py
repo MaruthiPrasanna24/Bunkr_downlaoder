@@ -16,7 +16,7 @@ from dump import (
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from pyrogram.errors import MessageNotModified
 import subprocess
@@ -53,18 +53,28 @@ app = Client(
     bot_token=BOT_TOKEN,
     workdir=".",
 )
-# Enhanced session with connection pooling — CHANGED HERE
+# Bunkr domain fallbacks (expanded)
+DOMAINS = ['la', 'su', 'is', 'ru', 'pk', 'sk', 'ph', 'ps', 'ci', 'ax', 'fi', 'ac', 'ws', 'red', 'site', 'black', 'cat', 'cc', 'org', 'cr', 'si', 'media', 'to', 'net', 'com', 'fi', 'albums.io']
+# Known CDN prefixes (expanded)
+CDN_PREFIXES = (
+    [f'cdn{i}.' for i in range(1, 13)] +
+    [f'media-files{i}.' for i in range(1, 10)] +
+    [f'i{i}.' for i in range(1, 10)] +
+    ['stream.', 'files.', 'c.', 'cdn.', 'media-files.', 'scdn.', 'c2wi.scdn.', '']
+)
+# Enhanced session with connection pooling and disable SSL verify for weak certs
 def create_optimized_session():
     """Create session with optimized connection pooling"""
     session = requests.Session()
+    session.verify = False  # Disable SSL verification for sites with weak certs
    
-    # Connection pooling + fewer retries + shorter timeout
+    # Connection pooling with increased pool size
     adapter = HTTPAdapter(
         pool_connections=10,
         pool_maxsize=20,
         max_retries=Retry(
-            total=2, # ← changed from 7 to 2
-            backoff_factor=1.5,
+            total=3,
+            backoff_factor=0.3,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
         )
@@ -73,14 +83,14 @@ def create_optimized_session():
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
-URL_PATTERN = r'(https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|black|net|to)|bunkrrr\.org|cyberdrop\.(?:me|cr|to|cc|nl))[^\s]+)'
+URL_PATTERN = r'(https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|net|to)|bunkrrr\.org|bunkr-albums\.io|cyberdrop\.(?:me|cr|to|cc|nl))[^\s]+)'
 def extract_urls(text):
     matches = re.findall(URL_PATTERN, text)
     logger.info(f"[v0] URL_PATTERN matches: {matches}")
     return matches
 def is_valid_bunkr_url(url):
     is_valid = bool(
-        re.match(r'https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|black|net|to)|bunkrrr\.org|cyberdrop\.(?:me|cr|to|cc|nl))', url)
+        re.match(r'https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|net|to)|bunkrrr\.org|bunkr-albums\.io|cyberdrop\.(?:me|cr|to|cc|nl))', url)
     )
     logger.info(f"[v0] is_valid_bunkr_url({url}) = {is_valid}")
     return is_valid
@@ -299,63 +309,92 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         status_msg = await message.reply_text(f"🔄 Processing: {url[:50]}...")
         last_status = ""
        
-        is_bunkr = "bunkr" in url.lower() or "bunkrrr" in url.lower()
-        logger.info(f"[v0] is_bunkr: {is_bunkr}")
+        is_bunkr = "bunkr" in url or "bunkrrr" in url or "bunkr-albums" in url
+        is_cyberdrop = "cyberdrop" in url.lower()
+        logger.info(f"[v0] is_bunkr: {is_bunkr}, is_cyberdrop: {is_cyberdrop}")
        
-        url = url.replace("bunkr.pk", "bunkr.su").replace("bunkr.is", "bunkr.su")
-       
-        if is_bunkr and not url.startswith("https"):
-            url = f"https://bunkr.su{url}"
-       
-        # ← CHANGED TIMEOUT HERE (album page request)
-        r = session.get(url, timeout=10)
-       
-        if r.status_code != 200:
-            await safe_edit(status_msg, f"❌ HTTP {r.status_code} on album page")
+        if not is_bunkr and not is_cyberdrop:
+            await safe_edit(status_msg, "❌ Unsupported URL")
             return
        
-        soup = BeautifulSoup(r.content, 'html.parser')
+        if not url.startswith("https"):
+            url = f"https://{url}"
        
-        is_direct = (
-            soup.find('span', {'class': 'ic-videos'}) is not None or
-            soup.find('div', {'class': 'lightgallery'}) is not None or
-            soup.find('a', id='download') is not None  # Added for Cyberdrop single file
-        )
+        # Parse path for domain fallback
+        parsed = urlparse(url)
+        path = parsed.path
+        if parsed.query:
+            path += '?' + parsed.query
+        
+        # Fetch album/page with domain fallback
+        r = None
+        soup = None
+        for tld in DOMAINS:
+            if tld == 'albums.io':
+                current_url = f"https://bunkr-albums.io{path}"
+            else:
+                current_url = f"https://bunkr.{tld}{path}" if is_bunkr else f"https://cyberdrop.{tld}{path}"
+            logger.info(f"[v0] Trying domain for album: {urlparse(current_url).netloc}")
+            try:
+                r = session.get(current_url, timeout=15)
+                if r.status_code == 200:
+                    soup = BeautifulSoup(r.content, 'html.parser')
+                    url = current_url  # Update for urljoin
+                    logger.info(f"[v0] Success on domain {tld} for album (HTTP 200)")
+                    break
+                else:
+                    logger.warning(f"[v0] Domain {tld} returned HTTP {r.status_code} for album")
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"[v0] Domain {tld} failed for album: {e}")
+        
+        if soup is None:
+            await safe_edit(status_msg, "❌ Failed to fetch from all domains")
+            return
        
         items = []
        
-        if is_direct:
-            if is_bunkr:
+        if is_bunkr:
+            is_direct = (
+                soup.find('span', {'class': 'ic-videos'}) is not None or
+                soup.find('div', {'class': 'lightgallery'}) is not None
+            )
+           
+            if is_direct:
                 h1 = soup.find('h1', {'class': 'text-[20px]'}) or soup.find('h1', {'class': 'truncate'})
+                album_name = h1.text if h1 else "file"
+                item = get_real_download_url(session, url, True, album_name)
+                if item:
+                    items.append(item)
             else:
-                h1 = soup.find('h1', id='title')
-            album_name = h1.text if h1 else "file"
-            item = get_real_download_url(session, url, True, album_name)
-            if item:
-                items.append(item)
-        else:
-            if is_bunkr:
                 h1 = soup.find('h1', {'class': 'truncate'})
-            else:
-                h1 = soup.find('h1', id='title')
-            album_name = h1.text if h1 else "album"
-            item_class = 'theItem' if is_bunkr else 'image-container column'
-            box_class = 'after:absolute' if is_bunkr else None
-            for theItem in soup.find_all('div', {'class': item_class}):
-                if box_class:
-                    box = theItem.find('a', {'class': box_class})
-                else:
-                    box = theItem.find('a')
-                if box:
-                    view_url = urljoin(url, box["href"])
-                    if is_bunkr:
+                album_name = h1.text if h1 else "album"
+                for theItem in soup.find_all('div', {'class': 'theItem'}):
+                    box = theItem.find('a', {'class': 'after:absolute'})
+                    if box:
+                        view_url = urljoin(url, box["href"])
                         name = theItem.find("p").text if theItem.find("p") else "file"
-                    else:
-                        img = box.find('img')
-                        name = img['alt'] if img and 'alt' in img.attrs else "file"
-                    direct_item = get_real_download_url(session, view_url, True, name)
-                    if direct_item:
-                        items.append(direct_item)
+                        direct_item = get_real_download_url(session, view_url, True, name)
+                        if direct_item:
+                            items.append(direct_item)
+        elif is_cyberdrop:
+            album_name = soup.find('h1', id='title').text.strip() if soup.find('h1', id='title') else "album"
+            # Check for single file
+            single_image = soup.find('img', id='image')
+            single_video = soup.find('video', id='video')
+            if single_image or single_video:
+                file_url = single_image['src'] if single_image else single_video['src'] if single_video else None
+                if file_url:
+                    items.append({"url": urljoin(url, file_url), "name": album_name})
+            else:
+                # Album
+                for div in soup.find_all('div', class_='image-container column'):
+                    a = div.find('a', class_='image')
+                    if a:
+                        view_url = urljoin(url, a['href'])
+                        name = a.img['alt'] if a.img and 'alt' in a.img.attrs else "file"
+                        direct_item = get_real_download_url(session, view_url, True, name)
+                        if direct_item:
+                            items.append(direct_item)
        
         if not items:
             await safe_edit(status_msg, "❌ No downloadable items found")
@@ -381,96 +420,126 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
            
             seen_urls.add(file_url)
             file_url = fix_bunkr_url(file_url)
+            logger.info(f"[v0] Original file URL: {file_url}")
            
             await safe_edit(
                 status_msg,
                 f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:30]}"
             )
            
+            # File download with domain fallback
             success = False
-            max_retries = 2 # ← also reduced here (manual retry loop)
-           
-            for attempt in range(max_retries):
-                try:
-                    headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        "Referer": "https://bunkr.su/" if is_bunkr else "https://cyberdrop.cr/"
-                    }
-                    # ← CHANGED TIMEOUT HERE (file download)
-                    response = session.get(file_url, stream=True, timeout=10, headers=headers)
-                   
-                    if response.status_code == 200:
-                        success = True
-                        break
-                    elif response.status_code == 404:
-                        logger.warning(f"HTTP 404 for {file_url} on attempt {attempt+1}")
-                        break
+            file_parsed = urlparse(file_url)
+            file_path = file_parsed.path
+            if file_parsed.query:
+                file_path += '?' + file_parsed.query
+            
+            # Extract original prefix
+            parts = file_parsed.netloc.split('.')
+            if len(parts) > 1:
+                original_tld = parts[-1]
+                original_prefix = '.'.join(parts[:-1]) + '.'
+            else:
+                original_prefix = ''
+                original_tld = ''
+            
+            # Prioritize original, then others
+            prefixes = [original_prefix] + [p for p in CDN_PREFIXES if p != original_prefix]
+            
+            final_path = os.path.join(download_path, file_name)
+            temp_path = os.path.join(download_path, f"temp_{file_name}")
+            
+            for prefix in prefixes:
+                for tld in DOMAINS:
+                    if tld == 'albums.io':
+                        new_netloc = prefix + 'bunkr-albums.io'
                     else:
-                        logger.warning(f"HTTP {response.status_code} on attempt {attempt+1}")
-               
-                except Exception as e:
-                    logger.warning(f"Attempt {attempt+1} failed: {str(e)}")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(1.5 ** attempt) # slightly faster backoff
+                        new_netloc = prefix + ('bunkr.' if is_bunkr else 'cyberdrop.') + tld
+                    current_file_url = file_parsed._replace(netloc=new_netloc).geturl()
+                    current_file_url = fix_bunkr_url(current_file_url)
+                    logger.info(f"[v0] Trying domain for file: {new_netloc}")
+                    try:
+                        headers = {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                            "Referer": "https://bunkr." + tld + "/" if is_bunkr else "https://cyberdrop." + tld + "/",
+                            "Accept": "*/*",
+                            "Accept-Language": "en-US,en;q=0.9",
+                            "Range": "bytes=0-"
+                        }
+                        response = session.get(current_file_url, stream=True, timeout=30, headers=headers)
+                        if response.status_code in (200, 206):
+                            file_size = int(response.headers.get("content-length", 0))
+                            downloaded = 0
+                            start_time = time.time()
+                            last_update = start_time
+                            with open(temp_path, "wb") as f:
+                                for chunk in response.iter_content(chunk_size=524288):
+                                    if chunk:
+                                        f.write(chunk)
+                                        downloaded += len(chunk)
+                                        current_time = time.time()
+                                        if current_time - last_update >= 5 and file_size > 0:
+                                            percent = int((downloaded / file_size) * 100)
+                                            elapsed = current_time - start_time
+                                            speed = downloaded / elapsed if elapsed > 0 else 0
+                                            eta = (file_size - downloaded) / speed if speed > 0 else 0
+                                            bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
+                                            speed_mbps = speed / 1024 / 1024
+                                            text = (
+                                                f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:25]}\n"
+                                                f"[{bar}] {percent}%\n"
+                                                f"{human_bytes(downloaded)} / {human_bytes(file_size)}\n"
+                                                f"⚡ Speed: {speed_mbps:.2f} MB/s | ETA: {int(eta // 60)}m {int(eta % 60)}s"
+                                            )
+                                            if text != last_status:
+                                                await safe_edit(status_msg, text)
+                                                last_status = text
+                                            last_update = current_time
+                            # Check if complete
+                            if downloaded == 0:
+                                logger.warning(f"[v0] Empty download from {current_file_url}")
+                                if os.path.exists(temp_path):
+                                    os.remove(temp_path)
+                                continue
+                            if file_size > 0 and downloaded != file_size:
+                                logger.warning(f"[v0] Partial download from {current_file_url}: {downloaded} / {file_size}")
+                                if os.path.exists(temp_path):
+                                    os.remove(temp_path)
+                                continue
+                            # Rename to final
+                            os.rename(temp_path, final_path)
+                            success = True
+                            logger.info(f"[v0] Success on domain {tld} with prefix {prefix} for file (HTTP {response.status_code})")
+                            break
+                        elif response.status_code == 404:
+                            logger.warning(f"[v0] HTTP 404 for {current_file_url} on domain {tld} with prefix {prefix}")
+                            continue
+                        else:
+                            logger.warning(f"[v0] Domain {tld} with prefix {prefix} returned HTTP {response.status_code} for file")
+                    except requests.exceptions.RequestException as e:
+                        logger.warning(f"[v0] File domain {tld} with prefix {prefix} failed: {e}")
+                if success:
+                    break
            
             if not success:
                 skipped_files.append(file_name)
                 await safe_edit(
                     status_msg,
-                    f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (failed after retries)"
+                    f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (all domains failed)"
                 )
                 logger.error(f"Skipped file: {file_name}")
                 continue
            
-            # ⚡ OPTIMIZED DOWNLOAD WITH LARGER CHUNKS
-            file_size = int(response.headers.get("content-length", 0))
-            final_path = os.path.join(download_path, file_name)
-            downloaded = 0
-            start_time = time.time()
-            last_update = start_time
-           
-            try:
-                with open(final_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=524288): # 512KB chunks
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        current_time = time.time()
-                       
-                        if current_time - last_update >= 5 and file_size > 0:
-                            percent = int((downloaded / file_size) * 100)
-                            elapsed = current_time - start_time
-                            speed = downloaded / elapsed if elapsed > 0 else 0
-                            eta = (file_size - downloaded) / speed if speed > 0 else 0
-                           
-                            bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
-                            speed_mbps = speed / 1024 / 1024
-                           
-                            text = (
-                                f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:25]}\n"
-                                f"[{bar}] {percent}%\n"
-                                f"{human_bytes(downloaded)} / {human_bytes(file_size)}\n"
-                                f"⚡ Speed: {speed_mbps:.2f} MB/s | ETA: {int(eta // 60)}m {int(eta % 60)}s"
-                            )
-                           
-                            if text != last_status:
-                                await safe_edit(status_msg, text)
-                                last_status = text
-                            last_update = current_time
-           
-            except Exception as download_err:
+            # Validate file size > 0
+            file_size_local = os.path.getsize(final_path)
+            if file_size_local == 0:
+                logger.warning(f"[v0] Empty file after download: {file_name}")
+                os.remove(final_path)
                 skipped_files.append(file_name)
-                await safe_edit(
-                    status_msg,
-                    f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (download error)"
-                )
-                logger.exception(f"Download failed for {file_name}: {download_err}")
-                if os.path.exists(final_path):
-                    os.remove(final_path)
+                await safe_edit(status_msg, f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (empty file)")
                 continue
            
-            # Video metadata extraction
+            # Video metadata extraction and validation
             duration = None
             width = None
             height = None
@@ -479,6 +548,12 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             if is_video:
                 logger.info(f"[v0] Getting video metadata for {file_name}")
                 duration = get_video_duration(final_path)
+                if duration is None or duration == 0:
+                    logger.warning(f"[v0] Corrupted video file: no duration for {file_name}")
+                    os.remove(final_path)
+                    skipped_files.append(file_name)
+                    await safe_edit(status_msg, f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (corrupted video)")
+                    continue
                 width, height = get_video_resolution_ffprobe(final_path)
                
                 if width is None and MOVIEPY_AVAILABLE:
@@ -519,6 +594,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             last_update_time = [upload_start_time]
            
             try:
+                # Open file in binary mode with optimized buffering
                 with open(final_path, "rb") as f:
                     if is_video:
                         send_kwargs = {
@@ -530,6 +606,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             "progress_args": (status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         }
                        
+                        # Add optional parameters only if they're valid
                         if thumb_path and os.path.exists(thumb_path):
                             send_kwargs["thumb"] = thumb_path
                         if duration is not None and duration > 0:
@@ -559,6 +636,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         )
                
+                # Log final upload speed
                 total_upload_time = time.time() - upload_start_time
                 file_size_mb = os.path.getsize(final_path) / 1024 / 1024
                 upload_speed_mbps = file_size_mb / total_upload_time if total_upload_time > 0 else 0
@@ -594,6 +672,7 @@ async def handle_message(client: Client, message: Message):
     if not unique_urls:
         return
    
+    # Use optimized session with connection pooling
     session = create_optimized_session()
    
     for url in unique_urls:
