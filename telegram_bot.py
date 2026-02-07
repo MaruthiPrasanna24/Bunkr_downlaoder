@@ -62,19 +62,19 @@ app = Client(
     workdir=".",
 )
 
-# Enhanced session with connection pooling — CHANGED HERE
+# Enhanced session with connection pooling — INCREASED RETRIES AND BACKOFF
 def create_optimized_session():
     """Create session with optimized connection pooling"""
     session = requests.Session()
     
-    # Connection pooling + fewer retries + shorter timeout
+    # Connection pooling + more retries + longer backoff
     adapter = HTTPAdapter(
         pool_connections=10,
         pool_maxsize=20,
         max_retries=Retry(
-            total=2,                    # ← changed from 7 to 2
-            backoff_factor=1.5,
-            status_forcelist=[429, 500, 502, 503, 504],
+            total=5,                    # Increased to 5
+            backoff_factor=2,           # Increased backoff
+            status_forcelist=[429, 500, 502, 503, 504, 523, 403],
             allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
         )
     )
@@ -151,12 +151,13 @@ def fix_bunkr_url(url: str) -> str:
     url = url.replace("c.bunkr-cache.se", "c.bunkr.su")
     url = url.replace("bunkr-cache.se", "bunkr.su")
     url = url.replace("c.bunkr.is", "c.bunkr.su")
+    url = url.replace("bunkr", "bunkrr")  # Handle new bunkrr variations
     return url
 
 def get_alternative_urls(url: str) -> list:
     parsed = urlparse(url)
     netloc = parsed.netloc
-    if 'bunkr' not in netloc:
+    if not netloc:
         return [url]
     
     parts = netloc.split('.')
@@ -167,18 +168,55 @@ def get_alternative_urls(url: str) -> list:
     domain = parts[1]
     tld = '.'.join(parts[2:])
     
-    possible_tlds = ['su', 'is', 'la', 'ru', 'media', 'sk', 'pk']
+    domain_variations = ['bunkr', 'bunkrr']  # Handle both variations
+    
+    # Expanded to all possible from URL_PATTERN
+    possible_tlds = ['su', 'is', 'la', 'ru', 'media', 'sk', 'pk', 'si', 'ph', 'ps', 'ci', 'ax', 'fi', 'ac', 'black', 'red', 'site', 'ws', 'org', 'cat', 'cc', 'com', 'net', 'to', 'cr']
     random.shuffle(possible_tlds)
     
     alternatives = []
-    for new_tld in possible_tlds:
-        if new_tld == tld:
-            continue
-        new_netloc = f"{subdomain}.{domain}.{new_tld}"
-        new_parsed = parsed._replace(netloc=new_netloc)
-        alternatives.append(urlunparse(new_parsed))
+    for var_domain in domain_variations:
+        for new_tld in possible_tlds:
+            if new_tld == tld and var_domain == domain:
+                continue
+            new_netloc = f"{subdomain}.{var_domain}.{new_tld}"
+            new_parsed = parsed._replace(netloc=new_netloc)
+            alternatives.append(urlunparse(new_parsed))
     
     return [url] + alternatives
+
+def get_direct_download_url(session, page_url, is_file=False, name=''):
+    """Custom function to extract direct download URL, prioritizing modern bunkr patterns"""
+    try:
+        r = session.get(page_url, timeout=10)
+        if r.status_code != 200:
+            logger.warning(f"Failed to fetch page {page_url}: HTTP {r.status_code}")
+            return None
+        
+        soup = BeautifulSoup(r.content, 'html.parser')
+        
+        # Priority 1: Modern download link (e.g., https://get.bunkrr.su/file/...)
+        download_a = soup.find('a', href=re.compile(r'https?://get\.bunkrr?\.(su|is|la|ru|media|etc)/file/\d+'))
+        if download_a:
+            return {'url': download_a['href'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip()}
+        
+        # Fallback: Video source src (old pattern)
+        video = soup.find('video')
+        if video:
+            source = video.find('source')
+            if source and 'src' in source.attrs:
+                return {'url': source['src'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip()}
+        
+        # Additional fallback: Any a with 'download' in text or class
+        fallback_a = soup.find('a', string=re.compile('download', re.I)) or soup.find('a', {'class': re.compile('download')})
+        if fallback_a and 'href' in fallback_a.attrs:
+            return {'url': fallback_a['href'], 'name': name or soup.find('h1', {'class': ['text-[20px]', 'truncate']}).text.strip()}
+        
+        logger.warning(f"No download URL found on {page_url}")
+        return None
+    except Exception as e:
+        logger.error(f"Error extracting direct URL from {page_url}: {e}")
+        return None
 
 def get_video_duration_ffprobe(video_path: str) -> int:
     """Get video duration using ffprobe"""
@@ -359,7 +397,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         if is_bunkr and not url.startswith("https"):
             url = f"https://bunkr.su{url}"
         
-        # ← CHANGED TIMEOUT HERE (album page request)
+        # Fetch album/page
         r = session.get(url, timeout=10)
         
         if r.status_code != 200:
@@ -377,19 +415,19 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         
         if is_direct:
             h1 = soup.find('h1', {'class': 'text-[20px]'}) or soup.find('h1', {'class': 'truncate'})
-            album_name = h1.text if h1 else "file"
-            item = get_real_download_url(session, url, True, album_name)
+            album_name = h1.text.strip() if h1 else "file"
+            item = get_direct_download_url(session, url, True, album_name)
             if item:
                 items.append(item)
         else:
             h1 = soup.find('h1', {'class': 'truncate'})
-            album_name = h1.text if h1 else "album"
+            album_name = h1.text.strip() if h1 else "album"
             for theItem in soup.find_all('div', {'class': 'theItem'}):
                 box = theItem.find('a', {'class': 'after:absolute'})
                 if box:
                     view_url = urljoin(url, box["href"])
-                    name = theItem.find("p").text if theItem.find("p") else "file"
-                    direct_item = get_real_download_url(session, view_url, True, name)
+                    name = theItem.find("p").text.strip() if theItem.find("p") else "file"
+                    direct_item = get_direct_download_url(session, view_url, True, name)
                     if direct_item:
                         items.append(direct_item)
         
@@ -435,8 +473,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                         "Referer": "https://bunkr.su/"
                     }
-                    # ← CHANGED TIMEOUT HERE (file download)
-                    response = session.get(try_url, stream=True, timeout=15, headers=headers)
+                    response = session.get(try_url, stream=True, timeout=30, headers=headers)  # Increased timeout
                     
                     if response.status_code == 200:
                         success = True
@@ -448,6 +485,10 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                     else:
                         logger.warning(f"HTTP {response.status_code} for {try_url}")
                 
+                except requests.exceptions.ConnectTimeout:
+                    logger.warning(f"Connect timeout for {try_url}")
+                except requests.exceptions.ConnectionError:
+                    logger.warning(f"Connection error (e.g., DNS) for {try_url}")
                 except Exception as e:
                     logger.warning(f"Failed to download from {try_url}: {str(e)}")
             
@@ -455,7 +496,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 skipped_files.append(file_name)
                 await safe_edit(
                     status_msg,
-                    f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (failed after trying domains)"
+                    f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (failed after trying all domains)"
                 )
                 logger.error(f"Skipped file: {file_name}")
                 continue
