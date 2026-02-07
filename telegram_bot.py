@@ -53,26 +53,27 @@ app = Client(
     bot_token=BOT_TOKEN,
     workdir=".",
 )
-# Bunkr domain fallbacks (expanded)
-DOMAINS = ['la', 'su', 'is', 'ru', 'pk', 'sk', 'ph', 'ps', 'ci', 'ax', 'fi', 'ac', 'ws', 'red', 'site', 'black', 'cat', 'cc', 'org', 'cr', 'si', 'media', 'to', 'net', 'com']
-# Known CDN prefixes (expanded with numbered CDNs)
+# Bunkr domain fallbacks (expanded with more from search)
+DOMAINS = ['la', 'su', 'is', 'ru', 'pk', 'sk', 'ph', 'ps', 'ci', 'ax', 'fi', 'ac', 'ws', 'red', 'site', 'black', 'cat', 'cc', 'org', 'cr', 'si', 'media', 'to', 'net', 'com', 'fi', 'albums.io']
+# Known CDN prefixes (expanded)
 CDN_PREFIXES = (
     [f'cdn{i}.' for i in range(1, 13)] +
     [f'media-files{i}.' for i in range(1, 10)] +
     [f'i{i}.' for i in range(1, 10)] +
-    ['stream.', 'files.', 'c.', 'cdn.', 'media-files.', '']
+    ['stream.', 'files.', 'c.', 'cdn.', 'media-files.', 'scdn.', 'c2wi.scdn.', '']
 )
-# Enhanced session with connection pooling
+# Enhanced session with connection pooling and disable SSL verify for weak certs
 def create_optimized_session():
     """Create session with optimized connection pooling"""
     session = requests.Session()
+    session.verify = False  # Disable SSL verification for sites with weak certs
    
     # Connection pooling with increased pool size
     adapter = HTTPAdapter(
         pool_connections=10,
         pool_maxsize=20,
         max_retries=Retry(
-            total=2,
+            total=3,
             backoff_factor=0.3,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
@@ -82,14 +83,14 @@ def create_optimized_session():
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
-URL_PATTERN = r'(https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|net|to)|bunkrrr\.org|cyberdrop\.(?:me|cr|to|cc|nl))[^\s]+)'
+URL_PATTERN = r'(https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|net|to)|bunkrrr\.org|bunkr-albums\.io|cyberdrop\.(?:me|cr|to|cc|nl))[^\s]+)'
 def extract_urls(text):
     matches = re.findall(URL_PATTERN, text)
     logger.info(f"[v0] URL_PATTERN matches: {matches}")
     return matches
 def is_valid_bunkr_url(url):
     is_valid = bool(
-        re.match(r'https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|net|to)|bunkrrr\.org|cyberdrop\.(?:me|cr|to|cc|nl))', url)
+        re.match(r'https?://(?:bunkr(?:r)?\.(?:sk|cr|ru|su|pk|is|si|ph|ps|ci|ax|fi|ac|black|la|media|red|site|ws|org|cat|cc|com|net|to)|bunkrrr\.org|bunkr-albums\.io|cyberdrop\.(?:me|cr|to|cc|nl))', url)
     )
     logger.info(f"[v0] is_valid_bunkr_url({url}) = {is_valid}")
     return is_valid
@@ -308,7 +309,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         status_msg = await message.reply_text(f"🔄 Processing: {url[:50]}...")
         last_status = ""
        
-        is_bunkr = "bunkr" in url or "bunkrrr" in url
+        is_bunkr = "bunkr" in url or "bunkrrr" in url or "bunkr-albums" in url
         logger.info(f"[v0] is_bunkr: {is_bunkr}")
        
         if is_bunkr and not url.startswith("https"):
@@ -324,8 +325,11 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
         r = None
         soup = None
         for tld in DOMAINS:
-            current_url = f"https://bunkr.{tld}{path}"
-            logger.info(f"[v0] Trying domain for album: bunkr.{tld}")
+            if tld == 'albums.io':
+                current_url = f"https://bunkr-albums.io{path}"
+            else:
+                current_url = f"https://bunkr.{tld}{path}"
+            logger.info(f"[v0] Trying domain for album: {urlparse(current_url).netloc}")
             try:
                 r = session.get(current_url, timeout=15)
                 if r.status_code == 200:
@@ -403,20 +407,30 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             file_parsed = urlparse(file_url)
             file_path = file_parsed.path
             if file_parsed.query:
-                file_path += '?' + parsed.query
+                file_path += '?' + file_parsed.query
             
             # Extract original prefix
             parts = file_parsed.netloc.split('.')
-            original_prefix = ''
-            if len(parts) > 2:
-                original_prefix = '.'.join(parts[:-2]) + '.'
+            if len(parts) > 1:
+                # Always replace the last part as tld
+                original_tld = parts[-1]
+                original_prefix = '.'.join(parts[:-1]) + '.'
+            else:
+                original_prefix = ''
+                original_tld = ''
             
             # Prioritize original, then others
             prefixes = [original_prefix] + [p for p in CDN_PREFIXES if p != original_prefix]
             
+            final_path = os.path.join(download_path, file_name)
+            temp_path = os.path.join(download_path, f"temp_{file_name}")
+            
             for prefix in prefixes:
                 for tld in DOMAINS:
-                    new_netloc = prefix + 'bunkr.' + tld
+                    if tld == 'albums.io':
+                        new_netloc = prefix + 'bunkr-albums.io'
+                    else:
+                        new_netloc = prefix + 'bunkr.' + tld
                     current_file_url = file_parsed._replace(netloc=new_netloc).geturl()
                     current_file_url = fix_bunkr_url(current_file_url)
                     logger.info(f"[v0] Trying domain for file: {new_netloc}")
@@ -431,7 +445,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         response = session.get(current_file_url, stream=True, timeout=30, headers=headers)
                         if response.status_code in (200, 206):
                             file_size = int(response.headers.get("content-length", 0))
-                            temp_path = os.path.join(download_path, f"temp_{file_name}")
                             downloaded = 0
                             start_time = time.time()
                             last_update = start_time
@@ -461,11 +474,13 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             # Check if complete
                             if downloaded == 0:
                                 logger.warning(f"[v0] Empty download from {current_file_url}")
-                                os.remove(temp_path)
+                                if os.path.exists(temp_path):
+                                    os.remove(temp_path)
                                 continue
                             if file_size > 0 and downloaded != file_size:
                                 logger.warning(f"[v0] Partial download from {current_file_url}: {downloaded} / {file_size}")
-                                os.remove(temp_path)
+                                if os.path.exists(temp_path):
+                                    os.remove(temp_path)
                                 continue
                             # Rename to final
                             os.rename(temp_path, final_path)
@@ -491,7 +506,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 logger.error(f"Skipped file: {file_name}")
                 continue
            
-            # Validate file
+            # Validate file size > 0
             file_size_local = os.path.getsize(final_path)
             if file_size_local == 0:
                 logger.warning(f"[v0] Empty file after download: {file_name}")
@@ -500,7 +515,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 await safe_edit(status_msg, f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (empty file)")
                 continue
            
-            # Video metadata extraction
+            # Video metadata extraction and validation
             duration = None
             width = None
             height = None
@@ -557,7 +572,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             try:
                 # Open file in binary mode with optimized buffering
                 with open(final_path, "rb") as f:
-                    if is_video and duration is not None and duration > 0:
+                    if is_video:
                         send_kwargs = {
                             "chat_id": message.chat.id,
                             "video": f,
@@ -570,7 +585,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         # Add optional parameters only if they're valid
                         if thumb_path and os.path.exists(thumb_path):
                             send_kwargs["thumb"] = thumb_path
-                        if duration > 0:
+                        if duration is not None and duration > 0:
                             send_kwargs["duration"] = duration
                         if width is not None and width > 0:
                             send_kwargs["width"] = width
@@ -578,6 +593,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             send_kwargs["height"] = height
                        
                         await client.send_video(**send_kwargs)
+                   
                     elif file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
                         await client.send_photo(
                             message.chat.id,
@@ -586,6 +602,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             progress=optimized_upload_progress,
                             progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         )
+                   
                     else:
                         await client.send_document(
                             message.chat.id,
