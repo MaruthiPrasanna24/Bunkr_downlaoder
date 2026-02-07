@@ -53,8 +53,10 @@ app = Client(
     bot_token=BOT_TOKEN,
     workdir=".",
 )
-# Bunkr domain fallbacks (prioritized based on common stability, expanded with more active ones)
-DOMAINS = ['la', 'su', 'is', 'ru', 'pk', 'sk', 'ph', 'ps', 'ci', 'ax', 'fi', 'ac']
+# Bunkr domain fallbacks (expanded with active ones from 2026)
+DOMAINS = ['la', 'su', 'is', 'ru', 'pk', 'sk', 'ph', 'ps', 'ci', 'ax', 'fi', 'ac', 'ws', 'red', 'site', 'black', 'cat', 'cc', 'org', 'cr']
+# Known CDN prefixes
+CDN_PREFIXES = ['media-files.', 'cdn.', 'i.', 'stream.', 'c.', 'files.', '']
 # Enhanced session with connection pooling
 def create_optimized_session():
     """Create session with optimized connection pooling"""
@@ -320,7 +322,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             current_url = f"https://bunkr.{tld}{path}"
             logger.info(f"[v0] Trying domain for album: bunkr.{tld}")
             try:
-                r = session.get(current_url, timeout=10)
+                r = session.get(current_url, timeout=15)
                 if r.status_code == 200:
                     soup = BeautifulSoup(r.content, 'html.parser')
                     url = current_url  # Update for urljoin
@@ -384,6 +386,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
            
             seen_urls.add(file_url)
             file_url = fix_bunkr_url(file_url)
+            logger.info(f"[v0] Original file URL: {file_url}")
            
             await safe_edit(
                 status_msg,
@@ -397,32 +400,44 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             if file_parsed.query:
                 file_path += '?' + file_parsed.query
             
-            for tld in DOMAINS:
-                parts = file_parsed.netloc.split('.')
-                if len(parts) >= 2 and parts[-2] == 'bunkr':
-                    parts[-1] = tld
-                    new_netloc = '.'.join(parts)
+            # Extract original prefix (subdomain)
+            parts = file_parsed.netloc.split('.')
+            original_prefix = ''
+            if len(parts) > 2:
+                original_prefix = '.'.join(parts[:-2]) + '.'
+            
+            # Prioritize original prefix, then others
+            prefixes = [original_prefix] + [p for p in CDN_PREFIXES if p != original_prefix]
+            
+            for prefix in prefixes:
+                for tld in DOMAINS:
+                    new_netloc = prefix + 'bunkr.' + tld
                     current_file_url = file_parsed._replace(netloc=new_netloc).geturl()
                     current_file_url = fix_bunkr_url(current_file_url)
                     logger.info(f"[v0] Trying domain for file: {new_netloc}")
                     try:
                         headers = {
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                            "Referer": "https://bunkr.su/"
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                            "Referer": "https://bunkr." + tld + "/",
+                            "Accept": "*/*",
+                            "Accept-Language": "en-US,en;q=0.9",
+                            "Range": "bytes=0-"  # For partial content support
                         }
-                        response = session.get(current_file_url, stream=True, timeout=10, headers=headers)
-                        if response.status_code == 200:
+                        response = session.get(current_file_url, stream=True, timeout=15, headers=headers)
+                        if response.status_code == 200 or response.status_code == 206:
                             file_url = current_file_url
                             success = True
-                            logger.info(f"[v0] Success on domain {tld} for file (HTTP 200)")
+                            logger.info(f"[v0] Success on domain {tld} with prefix {prefix} for file (HTTP {response.status_code})")
                             break
                         elif response.status_code == 404:
-                            logger.warning(f"[v0] HTTP 404 for {current_file_url} on domain {tld}")
-                            continue  # Try next domain instead of breaking
+                            logger.warning(f"[v0] HTTP 404 for {current_file_url} on domain {tld} with prefix {prefix}")
+                            continue
                         else:
-                            logger.warning(f"[v0] Domain {tld} returned HTTP {response.status_code} for file")
+                            logger.warning(f"[v0] Domain {tld} with prefix {prefix} returned HTTP {response.status_code} for file")
                     except requests.exceptions.RequestException as e:
-                        logger.warning(f"[v0] File domain {tld} failed: {e}")
+                        logger.warning(f"[v0] File domain {tld} with prefix {prefix} failed: {e}")
+                if success:
+                    break
            
             if not success:
                 skipped_files.append(file_name)
