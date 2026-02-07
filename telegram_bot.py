@@ -53,10 +53,15 @@ app = Client(
     bot_token=BOT_TOKEN,
     workdir=".",
 )
-# Bunkr domain fallbacks (expanded with active ones from 2026)
-DOMAINS = ['la', 'su', 'is', 'ru', 'pk', 'sk', 'ph', 'ps', 'ci', 'ax', 'fi', 'ac', 'ws', 'red', 'site', 'black', 'cat', 'cc', 'org', 'cr']
-# Known CDN prefixes
-CDN_PREFIXES = ['media-files.', 'cdn.', 'i.', 'stream.', 'c.', 'files.', '']
+# Bunkr domain fallbacks (expanded)
+DOMAINS = ['la', 'su', 'is', 'ru', 'pk', 'sk', 'ph', 'ps', 'ci', 'ax', 'fi', 'ac', 'ws', 'red', 'site', 'black', 'cat', 'cc', 'org', 'cr', 'si', 'media', 'to', 'net', 'com']
+# Known CDN prefixes (expanded with numbered CDNs)
+CDN_PREFIXES = (
+    [f'cdn{i}.' for i in range(1, 13)] +
+    [f'media-files{i}.' for i in range(1, 10)] +
+    [f'i{i}.' for i in range(1, 10)] +
+    ['stream.', 'files.', 'c.', 'cdn.', 'media-files.', '']
+)
 # Enhanced session with connection pooling
 def create_optimized_session():
     """Create session with optimized connection pooling"""
@@ -67,7 +72,7 @@ def create_optimized_session():
         pool_connections=10,
         pool_maxsize=20,
         max_retries=Retry(
-            total=2,  # Original + 2 retries = 3 attempts
+            total=2,
             backoff_factor=0.3,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
@@ -398,15 +403,15 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             file_parsed = urlparse(file_url)
             file_path = file_parsed.path
             if file_parsed.query:
-                file_path += '?' + file_parsed.query
+                file_path += '?' + parsed.query
             
-            # Extract original prefix (subdomain)
+            # Extract original prefix
             parts = file_parsed.netloc.split('.')
             original_prefix = ''
             if len(parts) > 2:
                 original_prefix = '.'.join(parts[:-2]) + '.'
             
-            # Prioritize original prefix, then others
+            # Prioritize original, then others
             prefixes = [original_prefix] + [p for p in CDN_PREFIXES if p != original_prefix]
             
             for prefix in prefixes:
@@ -421,11 +426,49 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             "Referer": "https://bunkr." + tld + "/",
                             "Accept": "*/*",
                             "Accept-Language": "en-US,en;q=0.9",
-                            "Range": "bytes=0-"  # For partial content support
+                            "Range": "bytes=0-"
                         }
-                        response = session.get(current_file_url, stream=True, timeout=15, headers=headers)
-                        if response.status_code == 200 or response.status_code == 206:
-                            file_url = current_file_url
+                        response = session.get(current_file_url, stream=True, timeout=30, headers=headers)
+                        if response.status_code in (200, 206):
+                            file_size = int(response.headers.get("content-length", 0))
+                            temp_path = os.path.join(download_path, f"temp_{file_name}")
+                            downloaded = 0
+                            start_time = time.time()
+                            last_update = start_time
+                            with open(temp_path, "wb") as f:
+                                for chunk in response.iter_content(chunk_size=524288):
+                                    if chunk:
+                                        f.write(chunk)
+                                        downloaded += len(chunk)
+                                        current_time = time.time()
+                                        if current_time - last_update >= 5 and file_size > 0:
+                                            percent = int((downloaded / file_size) * 100)
+                                            elapsed = current_time - start_time
+                                            speed = downloaded / elapsed if elapsed > 0 else 0
+                                            eta = (file_size - downloaded) / speed if speed > 0 else 0
+                                            bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
+                                            speed_mbps = speed / 1024 / 1024
+                                            text = (
+                                                f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:25]}\n"
+                                                f"[{bar}] {percent}%\n"
+                                                f"{human_bytes(downloaded)} / {human_bytes(file_size)}\n"
+                                                f"⚡ Speed: {speed_mbps:.2f} MB/s | ETA: {int(eta // 60)}m {int(eta % 60)}s"
+                                            )
+                                            if text != last_status:
+                                                await safe_edit(status_msg, text)
+                                                last_status = text
+                                            last_update = current_time
+                            # Check if complete
+                            if downloaded == 0:
+                                logger.warning(f"[v0] Empty download from {current_file_url}")
+                                os.remove(temp_path)
+                                continue
+                            if file_size > 0 and downloaded != file_size:
+                                logger.warning(f"[v0] Partial download from {current_file_url}: {downloaded} / {file_size}")
+                                os.remove(temp_path)
+                                continue
+                            # Rename to final
+                            os.rename(temp_path, final_path)
                             success = True
                             logger.info(f"[v0] Success on domain {tld} with prefix {prefix} for file (HTTP {response.status_code})")
                             break
@@ -448,53 +491,13 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                 logger.error(f"Skipped file: {file_name}")
                 continue
            
-            # ⚡ OPTIMIZED DOWNLOAD WITH LARGER CHUNKS
-            file_size = int(response.headers.get("content-length", 0))
-            final_path = os.path.join(download_path, file_name)
-            downloaded = 0
-            start_time = time.time()
-            last_update = start_time
-           
-            try:
-                with open(final_path, "wb") as f:
-                    # Use 512KB chunks for faster download
-                    for chunk in response.iter_content(chunk_size=524288): # 512KB chunks
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        current_time = time.time()
-                       
-                        if current_time - last_update >= 5 and file_size > 0:
-                            percent = int((downloaded / file_size) * 100)
-                            elapsed = current_time - start_time
-                            speed = downloaded / elapsed if elapsed > 0 else 0
-                            eta = (file_size - downloaded) / speed if speed > 0 else 0
-                           
-                            bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
-                            speed_mbps = speed / 1024 / 1024
-                           
-                            text = (
-                                f"⬇️ Downloading [{idx}/{len(items)}]: {file_name[:25]}\n"
-                                f"[{bar}] {percent}%\n"
-                                f"{human_bytes(downloaded)} / {human_bytes(file_size)}\n"
-                                f"⚡ Speed: {speed_mbps:.2f} MB/s | ETA: {int(eta // 60)}m {int(eta % 60)}s"
-                            )
-                           
-                            if text != last_status:
-                                await safe_edit(status_msg, text)
-                                last_status = text
-                            last_update = current_time
-           
-            except Exception as download_err:
+            # Validate file
+            file_size_local = os.path.getsize(final_path)
+            if file_size_local == 0:
+                logger.warning(f"[v0] Empty file after download: {file_name}")
+                os.remove(final_path)
                 skipped_files.append(file_name)
-                await safe_edit(
-                    status_msg,
-                    f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (download error)"
-                )
-                logger.exception(f"Download failed for {file_name}: {download_err}")
-                if os.path.exists(final_path):
-                    os.remove(final_path)
+                await safe_edit(status_msg, f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (empty file)")
                 continue
            
             # Video metadata extraction
@@ -506,6 +509,12 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             if is_video:
                 logger.info(f"[v0] Getting video metadata for {file_name}")
                 duration = get_video_duration(final_path)
+                if duration is None or duration == 0:
+                    logger.warning(f"[v0] Corrupted video file: no duration for {file_name}")
+                    os.remove(final_path)
+                    skipped_files.append(file_name)
+                    await safe_edit(status_msg, f"⚠️ Skipped [{idx}/{len(items)}]: {file_name[:30]} (corrupted video)")
+                    continue
                 width, height = get_video_resolution_ffprobe(final_path)
                
                 if width is None and MOVIEPY_AVAILABLE:
@@ -548,7 +557,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             try:
                 # Open file in binary mode with optimized buffering
                 with open(final_path, "rb") as f:
-                    if is_video:
+                    if is_video and duration is not None and duration > 0:
                         send_kwargs = {
                             "chat_id": message.chat.id,
                             "video": f,
@@ -561,7 +570,7 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                         # Add optional parameters only if they're valid
                         if thumb_path and os.path.exists(thumb_path):
                             send_kwargs["thumb"] = thumb_path
-                        if duration is not None and duration > 0:
+                        if duration > 0:
                             send_kwargs["duration"] = duration
                         if width is not None and width > 0:
                             send_kwargs["width"] = width
@@ -569,7 +578,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             send_kwargs["height"] = height
                        
                         await client.send_video(**send_kwargs)
-                   
                     elif file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
                         await client.send_photo(
                             message.chat.id,
@@ -578,7 +586,6 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             progress=optimized_upload_progress,
                             progress_args=(status_msg, file_name, idx, len(items), last_update_time, upload_start_time)
                         )
-                   
                     else:
                         await client.send_document(
                             message.chat.id,
