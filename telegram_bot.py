@@ -53,8 +53,8 @@ app = Client(
     bot_token=BOT_TOKEN,
     workdir=".",
 )
-# Bunkr domain fallbacks (prioritized based on common stability)
-DOMAINS = ['la', 'su', 'is', 'ru', 'pk', 'sk']
+# Bunkr domain fallbacks (prioritized based on common stability, expanded with more active ones)
+DOMAINS = ['la', 'su', 'is', 'ru', 'pk', 'sk', 'ph', 'ps', 'ci', 'ax', 'fi', 'ac']
 # Enhanced session with connection pooling
 def create_optimized_session():
     """Create session with optimized connection pooling"""
@@ -66,7 +66,7 @@ def create_optimized_session():
         pool_maxsize=20,
         max_retries=Retry(
             total=2,  # Original + 2 retries = 3 attempts
-            backoff_factor=0.5,
+            backoff_factor=0.3,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
         )
@@ -320,11 +320,14 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
             current_url = f"https://bunkr.{tld}{path}"
             logger.info(f"[v0] Trying domain for album: bunkr.{tld}")
             try:
-                r = session.get(current_url, timeout=15)
+                r = session.get(current_url, timeout=10)
                 if r.status_code == 200:
                     soup = BeautifulSoup(r.content, 'html.parser')
                     url = current_url  # Update for urljoin
+                    logger.info(f"[v0] Success on domain {tld} for album (HTTP 200)")
                     break
+                else:
+                    logger.warning(f"[v0] Domain {tld} returned HTTP {r.status_code} for album")
             except requests.exceptions.RequestException as e:
                 logger.warning(f"[v0] Domain {tld} failed for album: {e}")
         
@@ -407,16 +410,19 @@ async def download_and_send_file(client: Client, message: Message, url: str, ses
                             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                             "Referer": "https://bunkr.su/"
                         }
-                        response = session.get(current_file_url, stream=True, timeout=15, headers=headers)
+                        response = session.get(current_file_url, stream=True, timeout=10, headers=headers)
                         if response.status_code == 200:
                             file_url = current_file_url
                             success = True
+                            logger.info(f"[v0] Success on domain {tld} for file (HTTP 200)")
                             break
                         elif response.status_code == 404:
-                            logger.warning(f"HTTP 404 for {current_file_url}")
-                            break
+                            logger.warning(f"[v0] HTTP 404 for {current_file_url} on domain {tld}")
+                            continue  # Try next domain instead of breaking
+                        else:
+                            logger.warning(f"[v0] Domain {tld} returned HTTP {response.status_code} for file")
                     except requests.exceptions.RequestException as e:
-                        logger.warning(f"File domain {tld} failed: {e}")
+                        logger.warning(f"[v0] File domain {tld} failed: {e}")
            
             if not success:
                 skipped_files.append(file_name)
